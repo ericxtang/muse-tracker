@@ -3,6 +3,22 @@
 Versions follow MAJOR.MINOR.PATCH. `releases.json` records the source digest of
 each version; the build refuses sources that do not match their version.
 
+## 0.0.11 — 2026-10-21
+
+- **An agent that is still active keeps its root.** The tasks query's `end` now
+  stops at the window's end (`created_at < :until_iso`). Before, an agent active
+  while the query ran (such as the conversation running the export) had its
+  last activity past the window, dropped out of every window, and its root had
+  no input until it went quiet.
+- The CLI rejects a limited query whose rows are not in its paging column's
+  order (`QUERY_MISMATCH`). Such a query lets `LIMIT` keep the wrong rows, and
+  the page cut then drops the rest without a trace; a tasks query still ordered
+  on `start` after setup version 5 is the case this catches.
+- Setup version 6: bound `end` in `queries.tasks`, and guard each query's
+  own-run filter against NULLs (with `NOT IN`, one NULL empties the result). Setup version 5 now queues
+  its root re-send before exporting, and retries it in the same turn after a
+  `BUSY`.
+
 ## 0.0.10 — 2026-10-21
 
 - **Task roots follow the agent's last activity.** The `tasks` query now pages

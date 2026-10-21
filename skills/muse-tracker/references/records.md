@@ -41,11 +41,15 @@ Where the optional columns come from in `muse.db` (see `sample/schema.sql`):
     shows `request_text` when there is one, otherwise `context_text`, and
     `metadata.request_source` says which (`user` or `context`). Without it,
     subagent, hook-worker and pipeline roots have no input.
-  - `end` is the agent's last activity, and the query pages on it
-    (`tasksTimeColumn: "end"`): an agent's row comes back in every window where
-    it does something, so its root keeps the latest status and answer, and an
-    agent that started before the first window still gets its input. `start`
-    (its first activity) sets the root's start time.
+  - `end` is the agent's last activity **before the window's end**
+    (`MAX(created_at)` over its items with `created_at < :until_iso`), and the
+    query pages on it (`tasksTimeColumn: "end"`): an agent's row comes back in
+    every window where it does something, so its root keeps the latest status
+    and answer, and an agent that started before the first window still gets
+    its input. Without the `:until_iso` bound, an agent that is still active
+    when the query runs (the conversation running the export, for one) has its
+    last activity past the window and drops out of every window until it goes
+    quiet. `start` (its first activity) sets the root's start time.
 
 ## Query rules
 
@@ -55,7 +59,7 @@ Where the optional columns come from in `muse.db` (see `sample/schema.sql`):
   `2026-10-20 12:00:00`, compare `julianday(col)` with `julianday(:since_iso)`.
 - Filter and order on the contract's time column for that query
   (`tool_calls.started_at`, `model_calls.at`, `tasks.end`). The CLI pages on
-  it and rejects rows outside the window (`QUERY_MISMATCH`).
+  it and rejects rows outside the window or out of that order (`QUERY_MISMATCH`).
 - `tool_calls` and `model_calls` must end with `LIMIT :limit`; give `tasks`
   one too (it must have one to be re-sent on its own). A full result
   ends the page at its last timestamp; the next page starts there. Rows at that
@@ -86,7 +90,11 @@ worker lane a call ran in (earlier exports saw lanes such as
 `event-hook:<hook id>` in `runtime.execute_resolve_runs`), filter out the
 `event-hook:muse-tracker` lane in each query (and `event-hook:braintrust-telemetry`,
 this skill's hook id before 0.0.6, if it ever ran). Record the filter you used
-in `queries` so it is reviewed with them.
+in `queries` so it is reviewed with them. If the filter is
+`agent_id NOT IN (SELECT worker_agent_id …)`, add `worker_agent_id IS NOT NULL`
+to that subquery (or use `NOT EXISTS`): one NULL in a `NOT IN` list makes
+the query return no rows at all, and the export would send nothing without
+an error.
 
 ## What is known about muse.db
 

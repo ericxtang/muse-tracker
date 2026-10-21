@@ -437,6 +437,19 @@ class Export(Base):
         [root] = self.bt.of_type("task")
         self.assertEqual((root["metadata"]["status"], root["output"]), ("completed", "thing done"))
 
+    def test_a_query_not_in_its_paging_order_is_rejected(self):
+        # Paging on end but ordered on start: LIMIT would keep the wrong rows and the cut would drop the rest.
+        sql = self.LIVE_SQL.replace('ORDER BY julianday("end")', "ORDER BY julianday(start)")
+        self.write_config(tasksTimeColumn="end",
+                          queries={"tool_calls": TOOL_SQL, "model_calls": MODEL_SQL, "tasks": sql})
+        t0 = self.now - timedelta(hours=2)
+        self.live_task("parent", t0, t0 + timedelta(minutes=50), "plan the week", "completed")
+        self.live_task("child", t0 + timedelta(minutes=10), t0 + timedelta(minutes=20), None, "completed")
+        self.run_tool_queries(self.cli("plan"))
+        result = self.cli("export", expect=2)
+        self.assertEqual((result["code"], result.get("query")), ("QUERY_MISMATCH", "tasks"))
+        self.assertEqual(self.bt.inserts, [])
+
     def test_a_start_paged_tasks_query_still_works(self):
         # Configs from before setup version 5 page tasks on their first activity.
         t0 = self.now - timedelta(hours=2)

@@ -150,8 +150,9 @@ works.
    message and `context_text` from the preamble the agent started with (a
    subagent's begins `[Subagent Context]`), so every root shows what that
    agent was asked to do. It filters and orders on `end`, the agent's last
-   activity (`MAX(created_at)` of its items), so the row comes back whenever
-   the agent does something new; `start` is its first. Fill the
+   activity before the window's end (`MAX(created_at)` of its items with
+   `created_at < :until_iso`), so the row comes back in every window where the
+   agent does something, even while it is still active; `start` is its first. Fill the
    optional columns `muse.db` can supply (join `agent.agents` and
    `runtime.messages`): `session_id`, `parent_task_id`, `status`, `kind`,
    `model`, `depth` and `output_text` on tasks, `output_text` on model calls,
@@ -311,8 +312,22 @@ the person; stay silent unless one fails. Each change is safe to repeat.
   column, and set `"tasksTimeColumn": "end"` in the config; check with a dry
   run. For Braintrust, then repair roots already sent:
   `backfill --resend --only tasks --since HISTORY_FROM` (as in setup version 2),
-  and On wake steps 3–4 until `more: false`. For Langfuse, roots not yet sent
-  pick up the fix; roots already sent cannot be changed.
+  and On wake steps 3–4 until `more: false`. Queue it before On wake step 3; if
+  it returns `BUSY`, finish that run (steps 3–4) and queue it again in the same
+  turn. For Langfuse, roots not yet sent pick up the fix; roots already sent
+  cannot be changed.
+- **Setup version 6 (0.0.11): last activity stops at the window's end.** In
+  `queries.tasks`, compute `end` only from items with `created_at < :until_iso`
+  (add it to the `WHERE` of the `MAX(created_at)` it already takes), keep
+  filtering and ordering on that `end`, and check with a dry run. Without it,
+  an agent still active when the query runs falls outside the window and its
+  root waits until it goes quiet. Nothing needs re-sending: the next export
+  picks those agents up. In each saved query that leaves out this skill's lanes
+  with `NOT IN (SELECT worker_agent_id …)`, add `worker_agent_id IS NOT NULL`
+  to that subquery, as [the reference](references/records.md#leave-out-this-skills-own-runs)
+  explains. Then show the person the saved query with
+  `python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["queries"]["tasks"])' CONFIG`
+  and the config's `tasksTimeColumn`, exactly as printed.
 
 ## Verification
 

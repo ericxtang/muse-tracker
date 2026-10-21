@@ -48,7 +48,8 @@ TASKS_SQL = """
 SELECT * FROM (
   SELECT a.agent_id AS task_id, a.agent_id AS agent_id,
     (SELECT MIN(c.created_at) FROM "agent.context_items" c WHERE c.agent_id = a.agent_id) AS start,
-    (SELECT MAX(c.created_at) FROM "agent.context_items" c WHERE c.agent_id = a.agent_id) AS "end",
+    (SELECT MAX(c.created_at) FROM "agent.context_items" c WHERE c.agent_id = a.agent_id
+      AND julianday(c.created_at) < julianday(:until_iso)) AS "end",
     (SELECT substr(c.text_content, 1, 2000) FROM "agent.context_items" c
       WHERE c.agent_id = a.agent_id AND c.item_kind = 'message_text' AND c.role = 'user'
         AND c.text_content NOT LIKE '[Subagent Context]%' ORDER BY c.seq LIMIT 1) AS request_text,
@@ -164,6 +165,8 @@ def seed(db):
             "LP-2291 Authorization: Bearer sk-live-abcdefghijklmnopqrstuvwx", server="opentable")
     db.message("conv-a1", t + timedelta(minutes=4), "assistant", "Booked Lupa for Friday 7pm for two; confirmation LP-2291.",
                tokens=(8100, 95))
+    # The person replies while the export runs: activity after the run's end must not hide the agent's row.
+    db.item("conv-a1", NOW + timedelta(hours=1), "message_text", role="user", text_content="Thanks!")
     shell = NOW - timedelta(hours=2)
     db.agent("hook-c3", shell, "hook_worker", None, depth=1)
     db.message("hook-c3", shell, "user", "[Subagent Context] You are running as a hook worker. Check the inbox.")
@@ -318,6 +321,8 @@ def main():
         run.check("Braintrust", "conversation root carries request, answer, session",
                   roots["conv-a1"]["output"].startswith("Booked Lupa") and roots["conv-a1"]["metadata"]["session_id"] == "sess-dinner",
                   f"output {roots['conv-a1']['output'][:28]!r}…, session sess-dinner")
+        run.check("Braintrust", "an agent active while the export runs still gets its root",
+                  roots["conv-a1"].get("input", "").startswith("Book a table"), "reply at +1h; root has its request")
         run.check("Braintrust", "subagent links to its parent",
                   roots["sub-b2"]["metadata"].get("parent_task_id") == "conv-a1", "parent_task_id conv-a1")
         llm = [r for r in bt_rows if r["span_attributes"]["type"] == "llm"]

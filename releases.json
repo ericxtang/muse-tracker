@@ -38,5 +38,9 @@
   "0.0.10": {
     "digest": "62c82c2e5ffc277fdf92bbbd49df802dc41b323db77f75bd9fc2f2de8a8a2aba",
     "date": "2026-10-21"
+  },
+  "0.0.11": {
+    "digest": "f0b6b21f667ae613ac9714e5aa95f1c8d141fa9bb0b70fd8d63a596f28561181",
+    "date": "2026-10-21"
   }
 }

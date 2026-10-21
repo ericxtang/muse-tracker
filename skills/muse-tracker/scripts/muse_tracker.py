@@ -1142,6 +1142,11 @@ def cut_page(rows, page, limit, bounded=REQUIRED_QUERIES, columns=TIME_COLUMN):
                 raise Failure("QUERY_MISMATCH", f"{name} returned a row whose {column} is outside the window; "
                               f"filter on {column} with >= since AND < until.", 2, query=name, value=str(row.get(column)))
             values.append(t)
+        # LIMIT keeps the first rows in the query's order; the cut is only
+        # safe if that order is the paging column's.
+        if name in bounded and any(b < a for a, b in zip(values, values[1:])):
+            raise Failure("QUERY_MISMATCH", f"{name} rows are not in {column} order; "
+                          f"ORDER BY {column} before LIMIT :limit.", 2, query=name)
         times[name] = values
     full = [name for name in bounded if name in rows and len(rows[name]) >= limit]
     if not full:

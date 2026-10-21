@@ -78,7 +78,7 @@ python3 build.py --base-url https://skill-production-44c7.up.railway.app
 # dist/skills/braintrust-telemetry/{manifest.json,SKILL.md,setup.md}
 ```
 
-Hosted on Railway (project `muse-braintrust-bridge`, service `skill`); redeploy with `railway up --service skill` after changes. The service runs `serve.py`, which builds `dist/` for its own public
+Hosted on Railway (project `muse-tracker`, service `skill`), linked to this repo's `main` branch: a push deploys. The service runs `serve.py`, which builds `dist/` for its own public
 URL at startup. The archive is reproducible, so the same source always gives
 the same hash. Then tell Muse:
 

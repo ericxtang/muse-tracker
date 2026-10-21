@@ -21,14 +21,6 @@ writes the queries, runs a dry run and the first export, and installs the hook.
 
 It will ask whether you want to use BrainTrust or LangFuse, and for the API key.
 
-## Why muse.db
-
-Muse exposes no live instrumentation hooks, and tracing tools' setup flows
-cannot attach to a running Muse agent. But Muse's records database, `muse.db`,
-holds complete execution records. The skill reads those after the fact, so it
-needs no change to Muse and sees everything Muse recorded, including history
-from before it was installed.
-
 ## Destinations
 
 | Destination | Status | How rows are written | Read-back for verification |
@@ -82,6 +74,8 @@ read-back commands (`reconcile`, `find`, `probe`) exist for Braintrust only.
 | `sample/` | `muse.db` schema (from the real catalog) and a synthetic sample database |
 | `bin/bt-local` | Runs the CLI on this Mac with the Braintrust key from the macOS keychain |
 
+
+----
 ## Hosting
 
 Releases are [GitHub releases](https://github.com/ericxtang/muse-tracker/releases)

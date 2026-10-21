@@ -38,7 +38,8 @@ RELEASES = ROOT / "releases.json"
 
 
 def render(text, base_url, version):
-    return text.replace("{{BASE_URL}}", base_url).replace("{{VERSION}}", version)
+    return (text.replace("{{BASE_URL}}", base_url).replace("{{VERSION}}", version)
+            .replace("{{SETUP_VERSION}}", str(SETUP_VERSION)))
 
 
 def current_version():

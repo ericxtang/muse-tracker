@@ -28,6 +28,7 @@ import zipfile
 BASE_URL = "{{BASE_URL}}"
 SKILL = "braintrust-telemetry"
 VERSION = "{{VERSION}}"  # stamped by build.py from the repo's VERSION file
+SETUP_VERSION = "{{SETUP_VERSION}}"  # stamped by build.py; which Setup this release's SKILL.md describes
 API_URL = "https://api.braintrust.dev"
 API_HOST = "api.braintrust.dev"
 # Tests point provider env at a local server; the vault path always uses API_URL.
@@ -579,6 +580,33 @@ def stale_files(manifest):
 
 # ---------- commands ----------
 
+def installed_setup_version():
+    return int(SETUP_VERSION) if SETUP_VERSION.isdigit() else None
+
+
+def config_setup_version(config):
+    """The Setup the config was made with. Configs from before setup versions
+    were recorded (0.0.3 and earlier) were made with version 1."""
+    return int(config.get("setupVersion") or 1)
+
+
+def setup_required(config, latest=None):
+    """True until `setup-done` records that the config has the changes of every
+    setup version up to the installed (or just-installed) release's."""
+    latest = latest if latest is not None else installed_setup_version()
+    return latest is not None and latest > config_setup_version(config)
+
+
+def setup_done(config_path):
+    installed = installed_setup_version()
+    if installed is None:
+        raise Failure("SETUP_ERROR", "This copy of the skill was not built with a setup version.", 6)
+    config = read_json(config_path)
+    previous = config_setup_version(config)
+    atomic_json(config_path, {**config, "setupVersion": max(installed, previous)})
+    return {"ok": True, "setupVersion": max(installed, previous), "from": previous}
+
+
 def receipt(manifest, files):
     return {"ok": True, "version": manifest["version"], "setupVersion": manifest.get("setupVersion"),
             "sha256": manifest["sha256"], "files": files, "verifiedAt": now_ms()}
@@ -608,7 +636,7 @@ def setup_check():
     return receipt(manifest, files)
 
 
-def self_update(previous_receipt):
+def self_update(previous_receipt, config=None):
     """Install the latest release in place. Only the four bundled files change;
     config, state and anything else in the folder are kept."""
     for attempt in range(2):
@@ -649,15 +677,15 @@ def self_update(previous_receipt):
         changed_now, files = stale_files(manifest)
         if changed_now:
             raise Failure("UPDATE_FAILED", "Installed files still differ after the update.", 5, files=changed_now)
-        old_version = (previous_receipt or {}).get("setupVersion") or 0
         return {**receipt(manifest, files), "updated": True, "fromVersion": VERSION, "changedFiles": changed,
                 "from": (previous_receipt or {}).get("sha256"),
-                "setupRequired": (manifest.get("setupVersion") or 0) > old_version and old_version > 0,
+                "setupRequired": config is not None and setup_required(config, manifest.get("setupVersion") or 0),
                 "next": "re-read SKILL.md before continuing"}
     else:
         raise Failure("UPDATE_FAILED", "Could not download a release matching the manifest.", 5)
     _, files = stale_files(manifest)
-    return {**receipt(manifest, files), "updated": False}
+    return {**receipt(manifest, files), "updated": False,
+            "setupRequired": config is not None and setup_required(config, manifest.get("setupVersion") or 0)}
 
 
 TIME_COLUMN = {"tool_calls": "started_at", "model_calls": "at", "tasks": "start"}
@@ -1119,7 +1147,7 @@ def backfill(config_path, config, since_text, days, resend=False, only=None):
         atomic_json(directory / "export.json", state)
     return {"ok": True, "due": True, "window": window_json({"since": since, "until": until}),
             **({"only": sorted(only)} if only else {}),
-            "next": "run plan and export until more: false, as in On wake steps 2-3"}
+            "next": "run plan and export until more: false, as in On wake steps 3-4"}
 
 
 def check(config):
@@ -1137,6 +1165,7 @@ def status(config_path, config):
     checked = read_json(config_path).get("setupReceipt") or {}
     covered = state.get("coveredFrom")
     return {"ok": True, "version": VERSION, "lastVerifiedLatest": checked.get("version"),
+            "setupVersion": config_setup_version(config), "setupRequired": setup_required(config),
             "historyFrom": iso(covered) if covered else None, "lastBackfill": state.get("lastBackfill"),
             "stateDir": str(directory), "watermark": iso(watermark) if watermark else None,
             "runInProgress": {"since": iso(run["since"]), "cursor": iso(run["cursor"]), "until": iso(run["until"]), "backfill": bool(run.get("backfill")),
@@ -1195,7 +1224,8 @@ def due_wake(directory, config_path, config, dry_run):
     payload_ = {"attemptId": str(uuid.uuid4()), "wakeId": str(uuid.uuid4()), "wakeEmittedAt": now,
                 "config": str(config_path), "reasons": ["setup"] if dry_run else ["export"],
                 "installedVersion": VERSION, "latestVersion": latest_version,
-                "skillSha256": skill_sha, "updateRequired": update_required, "failureCount": failures,
+                "skillSha256": skill_sha, "updateRequired": update_required,
+                "setupRequired": setup_required(config), "failureCount": failures,
                 "watermark": iso(state["watermark"]) if state.get("watermark") else None}
     if not dry_run:
         timer.update(nextDue=now + delay, lastWakeAt=now, lastWakeId=payload_["wakeId"])
@@ -1205,7 +1235,7 @@ def due_wake(directory, config_path, config, dry_run):
 
 def main():
     parser = argparse.ArgumentParser(description="Muse → Braintrust telemetry. Every command prints one JSON object.")
-    parser.add_argument("command", choices=["version", "setup-check", "self-update", "check", "plan", "export", "status",
+    parser.add_argument("command", choices=["version", "setup-check", "self-update", "setup-done", "check", "plan", "export", "status",
                                             "hook", "probe", "reconcile", "find", "backfill"])
     parser.add_argument("--version", action="version", version=VERSION, help="Print the installed version and exit")
     parser.add_argument("--config", default=os.environ.get("BRAINTRUST_TELEMETRY_CONFIG"))
@@ -1226,12 +1256,15 @@ def main():
         return version_info()
     if args.command in ("setup-check", "self-update"):
         path = load_config(args.config)[0] if args.config else None
-        previous = read_json(path).get("setupReceipt") if path else None
+        current = read_json(path) if path else None
+        previous = current.get("setupReceipt") if path else None
         if args.command == "setup-check":
             result = setup_check()
+            if path:
+                result["setupRequired"] = setup_required(current, result.get("setupVersion") or 0)
         else:
             try:
-                result = self_update(previous)
+                result = self_update(previous, current)
             except Failure as failure:
                 if path:
                     with Locked(state_dir(path)) as directory:
@@ -1246,6 +1279,8 @@ def main():
             saved = {k: result[k] for k in ("version", "setupVersion", "sha256", "files", "verifiedAt")}
             atomic_json(path, {**read_json(path), "setupReceipt": saved})
         return result
+    if args.command == "setup-done":
+        return setup_done(load_config(args.config)[0])
     path, config = load_config(args.config)
     global API_OVERRIDE_OK
     API_OVERRIDE_OK = config.get("provider") == "env"

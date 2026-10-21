@@ -3,7 +3,16 @@
 Versions follow MAJOR.MINOR.PATCH. `releases.json` records the source digest of
 each version; the build refuses sources that do not match their version.
 
-## 0.0.4 — 2026-10-21
+## 0.0.5 — 2026-10-21
+
+- `setupRequired` no longer goes away after one `self-update`. The config
+  records its `setupVersion` (missing means 1), and the wake payload,
+  `self-update`, `setup-check` and `status` all report `setupRequired: true`
+  until the new `setup-done` command records the changes. A setup change cut
+  short is finished at the next wake.
+- The setup version is stamped into the CLI; new configs start with it.
+
+## 0.0.4 — 2026-10-21 (never deployed; superseded by 0.0.5)
 
 - Roots for agents with no user message (subagents, hook workers, pipeline
   stages) take their input from the preamble they started with, such as

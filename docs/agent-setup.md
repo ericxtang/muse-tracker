@@ -39,10 +39,9 @@ earlier download or a remembered hash does not establish the latest version.
 4. **Configure.** For a first installation, follow the skill's Setup. Use its
    defaults (the past 7 days of history; the project an existing Braintrust
    connector names) instead of asking; the person can ask for more later. For an
-   update, keep the config and hook. If `self-update` returned
-   `setupRequired: true`, redo the Setup steps the new `SKILL.md` marks as
-   changed, including the stored hook prompt (updating files does not rewrite
-   it).
+   update, keep the config and hook. If `self-update` reports
+   `setupRequired: true`, make the changes in the new `SKILL.md`'s Setup
+   changes section, then run `setup-done`.
 
 Never ask for the API key in chat. Keep update details out of the
 conversation unless setup is blocked.

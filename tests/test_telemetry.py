@@ -727,6 +727,23 @@ class Release(Base):
         hook = self.cli("hook", "--dry-run", script=cli)
         self.assertFalse(hook["payload"]["updateRequired"])
 
+    def test_setup_change_is_reported_until_setup_done(self):
+        build.build(self.bt.url, self.tmp / "v1")
+        cli = self.install(self.tmp / "v1")
+        self.bt.static = self.tmp / "served"
+        build.build(self.bt.url, self.bt.static)
+        # A config made by 0.0.3 or earlier has no setupVersion: it was set up with version 1.
+        self.assertTrue(self.cli("status", script=cli)["setupRequired"])
+        self.assertTrue(self.cli("hook", "--dry-run", script=cli)["payload"]["setupRequired"])
+        self.assertTrue(self.cli("self-update", script=cli)["setupRequired"])
+        self.assertTrue(self.cli("self-update", script=cli)["setupRequired"], "a repeated self-update keeps it")
+        self.assertTrue(self.cli("setup-check", script=cli)["setupRequired"])
+        done = self.cli("setup-done", script=cli)
+        self.assertEqual((done["from"], done["setupVersion"]), (1, build.SETUP_VERSION))
+        self.assertFalse(self.cli("status", script=cli)["setupRequired"])
+        self.assertFalse(self.cli("hook", "--dry-run", script=cli)["payload"]["setupRequired"])
+        self.assertFalse(self.cli("self-update", script=cli)["setupRequired"])
+
     def test_self_update_refuses_a_tampered_archive(self):
         build.build(self.bt.url, self.tmp / "v1")
         cli = self.install(self.tmp / "v1")

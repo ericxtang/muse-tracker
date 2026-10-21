@@ -118,7 +118,10 @@ railway up --service skill          # deploy; installs pick it up on their next 
 ```
 
 Add an entry to `CHANGELOG.md` for people. Bump `SETUP_VERSION` in `build.py`
-only when installed agents must repeat setup (for example, a new hook prompt).
+only when installed agents must change what Setup wrote (for example, a
+query or the hook prompt), and describe the change under "Setup changes" in
+`SKILL.md`. Installed agents see `setupRequired: true` on every wake until they
+make it and run `setup-done`.
 
 ## Verifying a live install
 

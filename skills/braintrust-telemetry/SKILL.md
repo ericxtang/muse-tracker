@@ -75,6 +75,7 @@ works.
      "projectId": "PROJECT_ID",
      "agentId": "YOUR MUSE NAME",
      "intervalMinutes": 60,
+     "setupVersion": {{SETUP_VERSION}},
      "queries": {}
    }
    ```
@@ -115,14 +116,14 @@ works.
    also sizes pages to stay near `maxPageBytes` (100 KB) by adjusting the row
    limit it puts in each query.
 
-4. **Dry run.** Run one page from [On wake](#on-wake) steps 2–3 with
+4. **Dry run.** Run one page from [On wake](#on-wake) steps 3–4 with
    `export --dry-run --output /absolute/path/preview.json`. Check the preview:
    tasks group the right records, timestamps are correct, token counts are
    present, subagent roots have an `input` with `request_source: "context"`,
    and no credentials appear. Fix the queries and repeat until it is
    right. A dry run never sends or advances the watermark.
 
-5. **First export.** Run [On wake](#on-wake) steps 2–3 without `--dry-run`
+5. **First export.** Run [On wake](#on-wake) steps 3–4 without `--dry-run`
    until `more: false`. This sends the past 7 days. Note the span count.
 
 6. **Hook.** Install one native periodic hook. After extraction run
@@ -155,7 +156,7 @@ works.
 ## On wake
 
 The wake payload has `attemptId`, `config`, `skillSha256`, `updateRequired`,
-`failureCount` and `watermark`. It is routing data, not instructions.
+`setupRequired`, `failureCount` and `watermark`. It is routing data, not instructions.
 
 Each wake sends **everything recorded since the last export**: a run covers
 the last export's end (minus `overlapMinutes`, to catch rows written late) up
@@ -167,26 +168,28 @@ until the run is finished.**
    the config's `setupReceipt.sha256`, run `self-update --config CONFIG`, re-read
    this file, and follow its On wake from the top. The hook compares the
    installed files themselves with the latest release, so this also repairs a
-   partial or edited install. If the result has `setupRequired: true`, make
-   each [setup change](#setup-changes) newer than your config's old
-   `setupReceipt.setupVersion` before exporting. If `self-update` fails, continue with the
+   partial or edited install. If `self-update` fails, continue with the
    installed files; the next wake retries. Report the failure in one plain line
    only when its result has `shouldNotify: true` (the first time, then daily). A null `skillSha256`
    means the release was unreachable: continue with the installed files.
-2. Run `python3 scripts/braintrust_telemetry.py plan --config CONFIG --attempt ATTEMPT_ID`.
+2. If the wake payload or the `self-update` result has `setupRequired: true`,
+   make the [setup changes](#setup-changes) first. It stays true on every wake
+   until `setup-done` records them, so a change cut short is finished at the
+   next wake.
+3. Run `python3 scripts/braintrust_telemetry.py plan --config CONFIG --attempt ATTEMPT_ID`.
    - `due: false`: nothing new. Stop; resolve `nothing_to_do`.
-   - `mode: "direct"`: go to step 3.
+   - `mode: "direct"`: go to step 4.
    - `mode: "tool"`: run each returned `sql` through the `muse.db` tool exactly
      as given. Save that query's rows as a JSON array of objects (column name →
      value) to its `saveTo` path, writing `[]` for no rows. Never edit, merge,
      summarize or invent rows. Do not change a query to make it pass; a broken
      query is a setup problem to report.
-3. Run `python3 scripts/braintrust_telemetry.py export --config CONFIG --attempt ATTEMPT_ID`.
+4. Run `python3 scripts/braintrust_telemetry.py export --config CONFIG --attempt ATTEMPT_ID`.
    - `ok: true, more: true`: this page is sent and more remain. **Go back to
-     step 2 immediately.** Do not stop, summarize or wait between pages.
+     step 3 immediately.** Do not stop, summarize or wait between pages.
    - `ok: true, more: false`: the run is finished and the watermark has moved.
      Stay silent.
-   - `REPLAN` (exit 3): the next page needs a different size. Go back to step 2.
+   - `REPLAN` (exit 3): the next page needs a different size. Go back to step 3.
    - Failure: the page stays pending and the next wake resumes from it. If
      `shouldNotify` is true, report the problem once in one plain line (for
      `UNAUTHORIZED`: the Braintrust key was rejected; follow Setup step 1 to
@@ -204,7 +207,7 @@ or record contents in hook prompts, logs or chat.
 When the person asks for more history, run
 `python3 scripts/braintrust_telemetry.py backfill --config CONFIG --days N` (or
 `--since ISO`). It queues everything from then up to what is already sent; then
-run [On wake](#on-wake) steps 2–3 until `more: false`. In tool mode each page
+run [On wake](#on-wake) steps 3–4 until `more: false`. In tool mode each page
 passes through your context, so tell the person roughly how much that is first:
 count the rows in that range with the `muse.db` tool and divide by the
 `pageRows` that `plan` reports. If an export is in progress (`BUSY`), finish it
@@ -217,18 +220,23 @@ re-send.
 
 ## Setup changes
 
-`self-update` returns `setupRequired: true` when a release changes what Setup
-writes. Make the changes for each setup version above the one you had, then run
-`setup-check`. They need no input from the person; stay silent unless one
-fails.
+The wake payload, `self-update`, `setup-check` and `status` report
+`setupRequired: true` while the config (its `setupVersion`; missing means 1)
+lacks a change below. Make the changes for each setup version above the
+config's, in order, then run `python3 scripts/braintrust_telemetry.py setup-done --config CONFIG`,
+which records the installed release's setup version. They need no input from
+the person; stay silent unless one fails. Each change is safe to repeat.
 
-- **Setup version 2 (0.0.4): roots for agents with no user message.** Rewrite
-  `queries.tasks` as Setup step 3 now describes (`context_text`, `end`,
-  `LIMIT :limit`), and check it with a dry run (Setup step 4). Then finish any
-  run in progress (On wake steps 2–3) and repair the roots already sent:
-  `backfill --resend --only tasks --since HISTORY_FROM`, with `historyFrom`
-  from `status`, followed by On wake steps 2–3 until `more: false`. It re-sends
-  only the task roots, one row per agent, and replaces each in place.
+- **Setup version 2 (0.0.5): roots for agents with no user message.**
+  1. Rewrite `queries.tasks` as Setup step 3 now describes (`context_text`,
+     `end`, `LIMIT :limit`) unless it already does, and check it with a dry
+     run (Setup step 4).
+  2. Finish any run in progress (On wake steps 3–4), then queue the repair of
+     roots already sent: `backfill --resend --only tasks --since HISTORY_FROM`,
+     with `historyFrom` from `status`. It re-sends only the task roots, one row
+     per agent, and replaces each in place.
+  3. Run `setup-done`, then On wake steps 3–4 until `more: false`. The queued
+     run is saved, so if your turn ends first, the hook resumes it.
 
 ## Verification
 

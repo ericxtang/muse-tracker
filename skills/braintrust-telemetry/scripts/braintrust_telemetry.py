@@ -316,6 +316,18 @@ def start_ms(row):
     return round(row["metrics"]["start"] * 1000)
 
 
+def root_request(task, seen, limit):
+    """A root's input and where it came from: the person's request, else the
+    preamble a machine-spawned agent (a subagent) was started with."""
+    if task.get("request_text"):
+        return clean(task["request_text"], limit), "user"
+    if seen.get("request") and seen.get("requestSource", "user") == "user":
+        return seen["request"], "user"
+    if task.get("context_text"):
+        return clean(task["context_text"], limit), "context"
+    return seen.get("request", ""), seen.get("requestSource") if seen.get("request") else None
+
+
 def build_traces(rows, ledger, config):
     """Group rows by task_id. Returns (task_id, events, ledger_entry) per task."""
     limit = int(config["maxAttributeChars"])
@@ -372,12 +384,12 @@ def build_traces(rows, ledger, config):
         if not times:
             continue
         start, end = min(times), max(times)
-        request = clean(task.get("request_text"), limit) if task.get("request_text") else seen.get("request", "")
+        request, source = root_request(task, seen, limit)
         metadata = {"task_id": task_id, "agent_id": task.get("agent_id") or seen.get("agent_id"),
-                    "surface": task.get("surface") or seen.get("surface")}
+                    "surface": task.get("surface") or seen.get("surface"), "request_source": source}
         root_event = event(trace, root, None, "agent_task", "task", start, end, metadata, input_=request or None)
         out.append((task_id, [root_event] + sorted(events, key=lambda e: (start_ms(e), e["span_id"])),
-                    {"start": start, "end": end, "request": request[:2000],
+                    {"start": start, "end": end, "request": request[:2000], "requestSource": source,
                      "agent_id": metadata["agent_id"], "surface": metadata["surface"]}))
     return sorted(out, key=lambda t: (start_ms(t[1][0]), t[0]))
 
@@ -675,6 +687,12 @@ def run_page(config, state, now):
     return {"since": run["cursor"], "until": run["until"], "limit": page_limit(config, state)}
 
 
+def run_queries(queries, run):
+    """The queries a run reads: all of them, or the subset backfill --only named."""
+    only = run.get("only")
+    return {name: sql for name, sql in queries.items() if not only or name in only}
+
+
 def rows_dir(directory, page):
     return directory / "rows" / f"{page['since']}-{page['until']}"
 
@@ -691,6 +709,7 @@ def plan(config_path, config):
         page = run_page(config, state, now_ms())
         if page is None:
             return {"ok": True, "due": False, "reason": "nothing new since the last export"}
+        queries = run_queries(queries, state["run"])
         atomic_json(directory / "export.json", state)
     result = {"ok": True, "due": True, "window": window_json(page)}
     if config.get("databases"):
@@ -751,7 +770,12 @@ def export(config_path, config, dry_run=False, output=None):
             raise failure if dry_run else record_failure(directory, failure)
 
 
-def cut_page(rows, page, limit):
+def limited(queries):
+    """Queries that take :limit; a full result from any of them ends the page."""
+    return [name for name, sql in queries.items() if ":limit" in sql]
+
+
+def cut_page(rows, page, limit, bounded=REQUIRED_QUERIES):
     """Check every row lies in the page, then, if a limited query came back
     full, cut the page at its last timestamp so no row is lost or split."""
     times = {}
@@ -765,7 +789,7 @@ def cut_page(rows, page, limit):
                               f"filter on {column} with >= since AND < until.", 2, query=name, value=str(row.get(column)))
             values.append(t)
         times[name] = values
-    full = [name for name in REQUIRED_QUERIES if len(rows[name]) >= limit]
+    full = [name for name in bounded if name in rows and len(rows[name]) >= limit]
     if not full:
         return rows, page["until"], False
     cut = min(max(times[name]) for name in full)
@@ -784,6 +808,7 @@ def export_page(directory, config, queries, dry_run, output):
     page = run_page(config, state, now)
     if page is None:
         return {"ok": True, "due": False, "reason": "nothing new since the last export"}
+    queries = run_queries(queries, state["run"])
     values = params(page, config)
     if direct:
         rows = run_direct(config, queries, values)
@@ -795,7 +820,7 @@ def export_page(directory, config, queries, dry_run, output):
             raise Failure("MISSING_ROWS", "Run every planned query and save its rows, even when empty ([]).", 2, missing=missing)
         page_bytes = sum((folder / f"{name}.json").stat().st_size for name in queries)
     try:
-        rows, cut, more = cut_page(rows, page, values["limit"])
+        rows, cut, more = cut_page(rows, page, values["limit"], limited(queries))
     except Failure as failure:
         if direct or failure.payload["code"] != "PAGE_STUCK" or values["limit"] >= int(config["maxRows"]):
             raise
@@ -952,7 +977,7 @@ def reconcile(config_path, config, since_text, until_text, limit=10_000):
                     "queries": [{"name": n, "sql": render(q, values), "saveTo": str(folder / f"{n}.json")}
                                 for n, q in queries.items()],
                     "next": "run each query with the muse.db tool, save the rows to saveTo, then run reconcile again"}
-    full = [name for name in REQUIRED_QUERIES if len(rows[name]) >= limit]
+    full = [name for name in limited(queries) if len(rows[name]) >= limit]
     if full:
         raise Failure("RANGE_TOO_LARGE", f"More than {limit} rows; reconcile a shorter range.", 2, queries=full)
     cut_page(rows, window, limit + 1)  # every row must lie in the range
@@ -1061,26 +1086,39 @@ def probe(config, scratch_project, wait_seconds=120):
             "rowsSeen": len(rows), "trace": trace}
 
 
-def backfill(config_path, config, since_text, days):
+def backfill(config_path, config, since_text, days, resend=False, only=None):
     """Queue older history: everything from `since` up to what is already sent.
-    It runs through the usual plan/export loop."""
+    With resend, everything from `since` up to the last export instead, so rows
+    already sent are rebuilt with the current queries and replaced in place.
+    `only` limits the run to some queries. It runs through the usual plan/export loop."""
     if bool(since_text) == bool(days):
         raise Failure("INVALID_INPUT", "backfill needs exactly one of --since ISO or --days N.", 2)
+    queries = configured_queries(config)
+    if only:
+        unknown = [name for name in only if name not in queries]
+        if unknown:
+            raise Failure("INVALID_INPUT", "--only names queries that are not configured: " + ", ".join(unknown), 2)
+        unbounded = [name for name in only if ":limit" not in queries[name]]
+        if unbounded:
+            raise Failure("SETUP_ERROR", f"queries.{unbounded[0]} must end with LIMIT :limit to be sent on its own.", 6)
     with Locked(state_dir(config_path)) as directory:
         state = read_json(directory / "export.json")
         covered = state.get("coveredFrom")
-        if covered is None:
+        if covered is None or (resend and state.get("watermark") is None):
             raise Failure("NOTHING_EXPORTED", "Run the first export before backfilling.", 2)
         if state.get("run"):
             raise Failure("BUSY", "An export is in progress; finish it (plan/export until more: false), then backfill.", 3)
         since = to_ms(since_text) if since_text else now_ms() - int(days) * 86_400_000
-        if since >= covered:
+        until = state["watermark"] if resend else covered
+        if since >= until:
             return {"ok": True, "due": False, "reason": f"history from {iso(covered)} is already sent"}
         now = now_ms()
-        state["run"] = {"since": since, "until": covered, "cursor": since, "pages": 0, "spans": 0, "sentSpans": 0,
-                        "startedAt": now, "touchedAt": now, "backfill": True}
+        state["run"] = {"since": since, "until": until, "cursor": since, "pages": 0, "spans": 0, "sentSpans": 0,
+                        "startedAt": now, "touchedAt": now, "backfill": True,
+                        **({"only": sorted(only)} if only else {}), **({"resend": True} if resend else {})}
         atomic_json(directory / "export.json", state)
-    return {"ok": True, "due": True, "window": window_json({"since": since, "until": covered}),
+    return {"ok": True, "due": True, "window": window_json({"since": since, "until": until}),
+            **({"only": sorted(only)} if only else {}),
             "next": "run plan and export until more: false, as in On wake steps 2-3"}
 
 
@@ -1102,6 +1140,7 @@ def status(config_path, config):
             "historyFrom": iso(covered) if covered else None, "lastBackfill": state.get("lastBackfill"),
             "stateDir": str(directory), "watermark": iso(watermark) if watermark else None,
             "runInProgress": {"since": iso(run["since"]), "cursor": iso(run["cursor"]), "until": iso(run["until"]), "backfill": bool(run.get("backfill")),
+                              "only": run.get("only"),
                               "pages": run["pages"]} if run else None,
             "lastExport": state.get("lastExport"), "failure": state.get("failure"),
             "updateFailure": state.get("updateFailure"),
@@ -1179,6 +1218,9 @@ def main():
     parser.add_argument("--marker", help="find: text to search for in exported inputs and outputs")
     parser.add_argument("--hours", type=int, default=48, help="find: how far back to search by arrival time")
     parser.add_argument("--days", type=int, help="backfill: send history from this many days ago")
+    parser.add_argument("--resend", action="store_true",
+                        help="backfill: rebuild and re-send history already sent, up to the last export")
+    parser.add_argument("--only", help="backfill: comma-separated queries to read, e.g. tasks")
     args = parser.parse_args()
     if args.command == "version":
         return version_info()
@@ -1222,7 +1264,8 @@ def main():
     if args.command == "find":
         return find(config, args.marker, args.hours)
     if args.command == "backfill":
-        return backfill(path, config, args.since, args.days)
+        only = [name.strip() for name in args.only.split(",") if name.strip()] if args.only else None
+        return backfill(path, config, args.since, args.days, args.resend, only)
     return hook(path, config, args.dry_run)
 
 

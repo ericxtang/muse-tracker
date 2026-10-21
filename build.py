@@ -29,7 +29,7 @@ SKILL = "braintrust-telemetry"
 FILES = ("SKILL.md", "assets/export-hook.sh", "references/records.md", "scripts/braintrust_telemetry.py")
 EXECUTABLE = {"assets/export-hook.sh", "scripts/braintrust_telemetry.py"}
 # Bump when an update requires installed agents to repeat setup.
-SETUP_VERSION = 1
+SETUP_VERSION = 2
 
 
 SEMVER = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")

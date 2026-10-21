@@ -97,8 +97,12 @@ works.
    `>= since AND < until`) **on the contract's time column** (`started_at`,
    `at`, `start`), orders by that column and ends with `LIMIT :limit`. The CLI
    rejects rows outside the window, and pages on that column. Store
-   them in `queries.tool_calls`, `queries.model_calls` and optionally
-   `queries.tasks`.
+   them in `queries.tool_calls`, `queries.model_calls` and `queries.tasks`.
+   The `tasks` query returns one row per agent, including agents with no user
+   message (subagents, hook workers): `request_text` from the first user
+   message and `context_text` from the preamble the agent started with (a
+   subagent's begins `[Subagent Context]`), so every root shows what that
+   agent was asked to do. Give it `end` and `LIMIT :limit` too.
 
    If the `muse.db` tables are SQLite files readable from your shell, add
    `databases` (schema name → absolute file path, for example
@@ -114,7 +118,8 @@ works.
 4. **Dry run.** Run one page from [On wake](#on-wake) steps 2–3 with
    `export --dry-run --output /absolute/path/preview.json`. Check the preview:
    tasks group the right records, timestamps are correct, token counts are
-   present, and no credentials appear. Fix the queries and repeat until it is
+   present, subagent roots have an `input` with `request_source: "context"`,
+   and no credentials appear. Fix the queries and repeat until it is
    right. A dry run never sends or advances the watermark.
 
 5. **First export.** Run [On wake](#on-wake) steps 2–3 without `--dry-run`
@@ -154,15 +159,17 @@ The wake payload has `attemptId`, `config`, `skillSha256`, `updateRequired`,
 
 Each wake sends **everything recorded since the last export**: a run covers
 the last export's end (minus `overlapMinutes`, to catch rows written late) up
-to the moment the run starts. The first run, with no `startAt`, covers all
-history. Large runs are split into pages by row count, and **you keep going
+to the moment the run starts. The first run, with no `startAt`, covers the past
+7 days. Large runs are split into pages by row count, and **you keep going
 until the run is finished.**
 
 1. If `updateRequired` is true, or `skillSha256` is non-null and differs from
    the config's `setupReceipt.sha256`, run `self-update --config CONFIG`, re-read
    this file, and follow its On wake from the top. The hook compares the
    installed files themselves with the latest release, so this also repairs a
-   partial or edited install. If `self-update` fails, continue with the
+   partial or edited install. If the result has `setupRequired: true`, make
+   each [setup change](#setup-changes) newer than your config's old
+   `setupReceipt.setupVersion` before exporting. If `self-update` fails, continue with the
    installed files; the next wake retries. Report the failure in one plain line
    only when its result has `shouldNotify: true` (the first time, then daily). A null `skillSha256`
    means the release was unreachable: continue with the installed files.
@@ -202,6 +209,26 @@ passes through your context, so tell the person roughly how much that is first:
 count the rows in that range with the `muse.db` tool and divide by the
 `pageRows` that `plan` reports. If an export is in progress (`BUSY`), finish it
 first. `status` shows `historyFrom`, how far back the sent history reaches.
+
+To rebuild rows already sent after a query changes, add `--resend`: the run
+covers from `--since`/`--days` up to the last export and replaces rows in
+place. `--only tasks` re-sends just the task roots, a small fraction of a full
+re-send.
+
+## Setup changes
+
+`self-update` returns `setupRequired: true` when a release changes what Setup
+writes. Make the changes for each setup version above the one you had, then run
+`setup-check`. They need no input from the person; stay silent unless one
+fails.
+
+- **Setup version 2 (0.0.4): roots for agents with no user message.** Rewrite
+  `queries.tasks` as Setup step 3 now describes (`context_text`, `end`,
+  `LIMIT :limit`), and check it with a dry run (Setup step 4). Then finish any
+  run in progress (On wake steps 2–3) and repair the roots already sent:
+  `backfill --resend --only tasks --since HISTORY_FROM`, with `historyFrom`
+  from `status`, followed by On wake steps 2–3 until `more: false`. It re-sends
+  only the task roots, one row per agent, and replaces each in place.
 
 ## Verification
 

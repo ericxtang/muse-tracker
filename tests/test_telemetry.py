@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,8 +124,12 @@ TOOL_SQL = ("SELECT task_id, seq, tool, args, result, started_at, ended_at, succ
 MODEL_SQL = ("SELECT task_id, message_id, at, input_tokens, output_tokens, model FROM agent.models "
              "WHERE julianday(at) >= julianday(:since_iso) AND julianday(at) < julianday(:until_iso) "
              "ORDER BY julianday(at) LIMIT :limit")
-TASK_SQL = ("SELECT task_id, start, request_text, surface FROM agent.tasks "
+TASK_SQL = ("SELECT task_id, start, request_text, context_text, surface FROM agent.tasks "
             "WHERE julianday(start) >= julianday(:since_iso) AND julianday(start) < julianday(:until_iso)")
+# What installs set up before 0.0.4 saved: no preamble column and no LIMIT.
+OLD_TASK_SQL = ("SELECT task_id, start, request_text, surface FROM agent.tasks "
+                "WHERE julianday(start) >= julianday(:since_iso) AND julianday(start) < julianday(:until_iso)")
+LIMITED_TASK_SQL = TASK_SQL + " ORDER BY julianday(start) LIMIT :limit"
 
 
 class Base(unittest.TestCase):
@@ -136,7 +141,7 @@ class Base(unittest.TestCase):
         with sqlite3.connect(self.db) as conn:
             conn.execute("CREATE TABLE tools (task_id, seq, tool, args, result, started_at, ended_at, success)")
             conn.execute("CREATE TABLE models (task_id, message_id, at, input_tokens, output_tokens, model)")
-            conn.execute("CREATE TABLE tasks (task_id, start, request_text, surface)")
+            conn.execute("CREATE TABLE tasks (task_id, start, request_text, context_text, surface)")
         self.config_path = self.tmp / "config.json"
         self.write_config()
 
@@ -168,9 +173,9 @@ class Base(unittest.TestCase):
         with sqlite3.connect(self.db) as conn:
             conn.execute("INSERT INTO models VALUES (?,?,?,?,?,?)", (task, message, iso(at), tokens_in, tokens_out, "claude"))
 
-    def add_task(self, task, at, request):
+    def add_task(self, task, at, request, context=None):
         with sqlite3.connect(self.db) as conn:
-            conn.execute("INSERT INTO tasks VALUES (?,?,?,?)", (task, iso(at), request, "main"))
+            conn.execute("INSERT INTO tasks VALUES (?,?,?,?,?)", (task, iso(at), request, context, "main"))
 
     def run_tool_queries(self, plan):
         """What the worker does with the muse.db tool: run the SQL as given, save the rows."""
@@ -269,6 +274,50 @@ class Export(Base):
         self.assertEqual(state["watermark"], watermark, "the hourly export's place is unchanged")
         self.assertIn("lastBackfill", state)
         self.assertFalse(self.cli("backfill", "--days", "400")["due"], "already sent")
+
+    def test_subagent_root_takes_its_input_from_its_preamble(self):
+        t0 = self.now - timedelta(hours=2)
+        preamble = "[Subagent Context] You are running as a subagent (depth 1/2). Task: list open PRs."
+        self.add_task("person", t0, "summarize", context="[Subagent Context] unused")
+        self.add_task("sub", t0 + timedelta(minutes=1), None, context=preamble)
+        self.add_task("bare", t0 + timedelta(minutes=2), None)
+        self.add_tool("sub", 0, t0 + timedelta(minutes=1, seconds=5))
+        self.wake()
+        roots = {r["metadata"]["task_id"]: r for r in self.bt.of_type("task")}
+        self.assertEqual((roots["person"]["input"], roots["person"]["metadata"]["request_source"]), ("summarize", "user"))
+        self.assertEqual((roots["sub"]["input"], roots["sub"]["metadata"]["request_source"]), (preamble, "context"))
+        self.assertEqual((roots["bare"].get("input"), roots["bare"]["metadata"].get("request_source")), (None, None))
+
+    def test_resending_tasks_fixes_roots_already_sent_without_resending_calls(self):
+        t0 = self.now - timedelta(days=3)
+        for i in range(7):
+            self.add_task(f"sub{i}", t0 + timedelta(hours=i), None, context=f"[Subagent Context] job {i}")
+            self.add_tool(f"sub{i}", i, t0 + timedelta(hours=i, minutes=1))
+        self.write_config(queries={"tool_calls": TOOL_SQL, "model_calls": MODEL_SQL, "tasks": OLD_TASK_SQL})
+        self.wake()
+        self.assertTrue(all(r.get("input") is None for r in self.bt.of_type("task")), "the old query has no preamble")
+        watermark, sent_before = self.state()["watermark"], len(self.bt.sent())
+
+        # Setup version 2: the rewritten query, then a tasks-only resend.
+        self.write_config(maxRows=5, queries={"tool_calls": TOOL_SQL, "model_calls": MODEL_SQL, "tasks": TASK_SQL})
+        self.assertEqual(self.cli("backfill", "--resend", "--only", "tasks", "--days", "7", expect=6)["code"], "SETUP_ERROR",
+                         "a tasks query without LIMIT :limit cannot be paged on its own")
+        self.write_config(maxRows=5, queries={"tool_calls": TOOL_SQL, "model_calls": MODEL_SQL, "tasks": LIMITED_TASK_SQL})
+        self.assertFalse(self.cli("backfill", "--days", "7")["due"], "without --resend, sent history is skipped")
+        queued = self.cli("backfill", "--resend", "--only", "tasks", "--days", "7")
+        self.assertEqual(queued["only"], ["tasks"])
+        results = self.wake()
+        self.assertEqual([r["pageSpans"] for r in results], [4, 3], "paged on the tasks query alone (pages of 5 rows)")
+        resent = self.bt.sent()[sent_before:]
+        self.assertEqual({e["span_attributes"]["type"] for e in resent}, {"task"}, "only roots are re-sent")
+        roots = {r["metadata"]["task_id"]: r for r in self.bt.of_type("task")}
+        self.assertEqual(len(roots), 7, "replaced in place, one row per task")
+        self.assertEqual(roots["sub4"]["input"], "[Subagent Context] job 4")
+        tool = next(r for r in self.bt.of_type("tool") if r["metadata"]["task_id"] == "sub4")
+        self.assertLessEqual(roots["sub4"]["metrics"]["start"], tool["metrics"]["start"])
+        self.assertGreaterEqual(roots["sub4"]["metrics"]["end"], tool["metrics"]["end"], "root bounds still cover the calls")
+        state = self.state()
+        self.assertEqual((state["watermark"], state["run"]), (watermark, None))
 
     def test_page_cut_keeps_rows_that_share_the_boundary_timestamp(self):
         base = self.now - timedelta(hours=3)
@@ -668,8 +717,12 @@ class Release(Base):
         self.assertFalse(self.cli("self-update", script=cli)["updated"])
 
         # A third release: the updated CLI keeps following the latest.
-        v3 = build.build(self.bt.url, self.bt.static, source=self.newer_source("release three"), version="9.3.0")
-        self.assertEqual(self.cli("self-update", script=cli)["version"], "9.3.0")
+        self.assertFalse(self.cli("self-update", script=cli)["updated"])
+        # A third release that changes setup: the updated install is told to redo it.
+        with mock.patch.object(build, "SETUP_VERSION", build.SETUP_VERSION + 1):
+            v3 = build.build(self.bt.url, self.bt.static, source=self.newer_source("release three"), version="9.3.0")
+        result = self.cli("self-update", script=cli)
+        self.assertEqual((result["version"], result["setupRequired"]), ("9.3.0", True))
         self.assertEqual(self.cli("status", script=cli)["version"], "9.3.0")
         hook = self.cli("hook", "--dry-run", script=cli)
         self.assertFalse(hook["payload"]["updateRequired"])

@@ -3,6 +3,18 @@
 Versions follow MAJOR.MINOR.PATCH. `releases.json` records the source digest of
 each version; the build refuses sources that do not match their version.
 
+## 0.0.4 — 2026-10-21
+
+- Roots for agents with no user message (subagents, hook workers, pipeline
+  stages) take their input from the preamble they started with, such as
+  `[Subagent Context] …`, via the new `context_text` column of the `tasks`
+  query. `metadata.request_source` says `user` or `context`.
+- `backfill --resend` re-sends history already sent, rebuilt with the current
+  queries; `--only tasks` limits it to task roots.
+- A `tasks` query with `LIMIT :limit` now pages like the others.
+- Setup version 2: installed agents rewrite their `tasks` query and repair the
+  roots already sent, on their own, at the next wake.
+
 ## 0.0.3 — 2026-10-21
 
 - The first export sends the past 7 days (`backfillDays`) instead of all

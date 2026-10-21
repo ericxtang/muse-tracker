@@ -95,6 +95,9 @@ I can read it. Messages in quotes go to Muse.
    - the start times match when you ran them (a whole-hour offset means a
      timezone bug);
    - Muse's reply appears as an `llm` span with token counts.
+5. Ask Muse to "use a subagent to list the files in your workspace", then
+   export again. Its trace's root `input` must be the subagent's
+   `[Subagent Context]` preamble, with `metadata.request_source: context`.
 4. Ask Muse:
    > Show the token usage row muse.db has for your "done" message.
 
@@ -128,7 +131,7 @@ affected time.
 | **Interrupt a run.** Ask "Run the export now", then press stop while it is paging. | `status` shows `runInProgress`. About 15 minutes after the last page, the hook resumes it and `runInProgress` returns to `null`. |
 | **Lose local state.** Ask Muse to delete the directory `status` reports as `stateDir`, then run the export. | It re-sends the past 7 days. Reconcile: `duplicates: 0`. |
 | **Ask for older history.** "Send my Braintrust telemetry from the past 30 days." | Muse estimates the pages, runs `backfill --days 30` and pages through it; `status` → `historyFrom` moves back 30 days; reconcile over days 8–30 is clean, and the hourly export keeps running. |
-| **Ship an update.** Tell me "release 0.0.3". | At the next wake the hook reports `installedVersion` 0.0.2 → `latestVersion` 0.0.3. Muse updates itself, `version` says `upToDate: true`, and exports continue. |
+| **Ship an update.** Tell me "release 0.0.5". | At the next wake the hook reports `installedVersion` 0.0.4 → `latestVersion` 0.0.5. Muse updates itself, `version` says `upToDate: true`, and exports continue. |
 
 ## 6. Soak (7 days)
 

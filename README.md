@@ -154,8 +154,10 @@ tested by running the plan's rendered SQL against a real SQLite file. Covered:
 all history in one wake across many pages, rows sharing a page-boundary
 timestamp, late rows caught by the overlap, a full re-export after losing
 state (still one row per record), retry after a partial send, 401 and 429
-handling, a task spanning two runs, direct mode, run resumption, the hook
-script under a stub runtime, and reproducible builds with `setup-check`.
+handling, a task spanning two runs, direct mode, run resumption, subagent
+roots taking their input from their preamble, a tasks-only resend that
+repairs roots already sent, the hook script under a stub runtime, and
+reproducible builds with `setup-check` and `setupRequired`.
 
 ## Not verified
 

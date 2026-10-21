@@ -10,7 +10,7 @@ with the same `task_id` become one trace. Unknown extra columns are ignored.
 | --- | --- | --- |
 | `tool_calls` | `task_id`, `tool`, `started_at` | `id` or `seq` (stable per call), `ended_at`, `args`, `result`, `success` |
 | `model_calls` | `task_id`, `at` | `message_id` or `id`, `ended_at`, `input_tokens`, `output_tokens`, `model`, `note` |
-| `tasks` | `task_id` | `start`, `end`, `request_text`, `agent_id`, `surface` |
+| `tasks` | `task_id`, `start` | `end`, `request_text`, `context_text`, `agent_id`, `surface` |
 
 - Times may be ISO-8601 strings or epoch seconds/ms/µs/ns.
 - `success` may be boolean, `0`/`1` or text such as `"ok"`/`"error"`. Leave it
@@ -21,8 +21,17 @@ with the same `task_id` become one trace. Unknown extra columns are ignored.
   (`substr(result, 1, 4000)`) to keep the tool output small.
 - Stable `id`/`seq`/`message_id` values make span IDs stable. Without them the
   CLI derives an ID from the start time, tool name and arguments.
-- `tasks` rows supply the request text and surface. Without one, a task's
-  bounds come from its calls.
+- `tasks` rows supply the root's input and surface: one row per agent, even
+  for agents with no user message. Without one, a task's bounds come from its
+  calls.
+  - `request_text` is the agent's first user message.
+  - `context_text` is the preamble a machine-spawned agent starts with instead,
+    such as a subagent's context item that begins `[Subagent Context]`. The root
+    shows `request_text` when there is one, otherwise `context_text`, and
+    `metadata.request_source` says which (`user` or `context`). Without it,
+    subagent, hook-worker and pipeline roots have no input.
+  - `end` is the agent's last activity. It keeps a root's bounds right when the
+    root is re-sent on its own (`backfill --resend --only tasks`).
 
 ## Query rules
 
@@ -33,7 +42,8 @@ with the same `task_id` become one trace. Unknown extra columns are ignored.
 - Filter and order on the contract's time column for that query
   (`tool_calls.started_at`, `model_calls.at`, `tasks.start`). The CLI pages on
   it and rejects rows outside the window (`QUERY_MISMATCH`).
-- `tool_calls` and `model_calls` must end with `LIMIT :limit`. A full result
+- `tool_calls` and `model_calls` must end with `LIMIT :limit`; give `tasks`
+  one too (it must have one to be re-sent on its own). A full result
   ends the page at its last timestamp; the next page starts there. Rows at that
   timestamp move to the next page, so none are lost or split. More than
   `maxRows` rows at one timestamp stops with `PAGE_STUCK`; raise `maxRows`.
@@ -76,12 +86,22 @@ Observed 2026-10-14 to 2026-10-20 while building the first export by hand:
 - `runtime.messages` and `runtime.events` hold message bodies and may supply
   `request_text` for the `tasks` query.
 
+Observed 2026-10-21: `muse.db` creates an agent for every subagent, hook worker
+and pipeline stage, not only conversations. Of 4,456 agents, 2,187 ever
+received a user message. The rest got their instructions as a context
+preamble: a subagent's first context item begins "[Subagent Context] You are
+running as a subagent (depth 1/2)…". Read a few before choosing `substr`
+bounds, so the part that states the task survives the cut. Some agents
+(58 of 4,456) hold only that preamble: no calls, start equal to end.
+
 ## Runs, pages and duplicates
 
 - **A run sends everything since the last export.** It covers the watermark
   minus `overlapMinutes` up to the moment it starts. The first run covers the
   past `backfillDays` (7), or from `startAt`; `backfill` sends older history
-  later as a separate run that leaves the watermark alone. Pages split it by row count; the worker, or
+  later as a separate run that leaves the watermark alone. `backfill --resend`
+  re-sends history already sent, rebuilt with the current queries, and
+  `--only tasks` limits that to the task roots. Pages split it by row count; the worker, or
   `export` itself in direct mode, repeats until `more: false`.
 - **The overlap catches late rows.** A tool call written when it finishes can
   carry a start time before the last export; re-reading the last 30 minutes
@@ -110,7 +130,7 @@ exponential backoff, honoring `Retry-After`. Requests stay under
 
 | Row | `span_attributes` | Fields |
 | --- | --- | --- |
-| Task root | `agent_task`, type `task` | `input` = request text; `metadata.task_id`, `agent_id`, `surface`; `metrics.start/end` |
+| Task root | `agent_task`, type `task` | `input` = request text, else the context preamble; `metadata.task_id`, `agent_id`, `surface`, `request_source`; `metrics.start/end` |
 | Model call | `model_call`, type `llm` | `metrics.prompt_tokens`, `completion_tokens`, `tokens`; `metadata.model`, `message_id` |
 | Tool call | tool name, type `tool` | `input` = args, `output` = result; failures set `error`; `metadata.seq`, `success` |
 

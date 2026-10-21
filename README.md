@@ -18,16 +18,8 @@ Tell Muse:
 
 Muse downloads the release, checks its hash against the manifest, installs it,
 writes the queries, runs a dry run and the first export, and installs the hook.
-It reuses an existing `custom.braintrust` vault card and the project an
-existing Braintrust connector names, so setup asks no questions when those
-exist.
 
-**Moving from `braintrust-telemetry`.** This skill had that name before 0.0.6.
-The setup guide detects an old install and runs `migrate`, which copies its
-config and export state (watermark, run in progress, sent rows) to the new
-names, so the export continues where it stopped. Row ids do not depend on the
-skill's name, so nothing already sent is duplicated. Until it moves, an old
-install keeps exporting with the files it has; it no longer receives updates.
+It will ask whether you want to use BrainTrust or LangFuse, and for the API key.
 
 ## Why muse.db
 

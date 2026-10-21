@@ -1,0 +1,6 @@
+# Generated artifacts -- build them from the sample pipeline instead.
+sample/sample_muse.db
+records.json
+otlp.json
+trace_id.txt
+__pycache__/

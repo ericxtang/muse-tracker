@@ -38,7 +38,40 @@ sources and their limits (token usage is recorded only for user-visible
 assistant messages; the bridge ships historical records, not a live span
 stream).
 
+## Sample database
+
+So you can develop against the bridge without a live Muse install, `sample/`
+carries the muse.db schema for the tables the bridge touches:
+
+- `sample/schema.sql` — PostgreSQL DDL with the exact column definitions
+  from the real muse.db catalog: `agent.context_items` and
+  `agent.agent_message_token_usage` (the bridge's sources), plus the tables
+  their foreign keys point at (`agent.agents`, `runtime.messages`,
+  `runtime.tool_calls`, `runtime.tool_outputs`). muse.db has ~200 tables in
+  total; this is the self-contained subgraph the bridge needs.
+- `sample/make_sample.py` — builds `sample_muse.db`, a SQLite file with the
+  same tables/columns (schema-qualified names, quoted) and fully synthetic
+  seed data: one agent runs one short task — book a restaurant table; first
+  attempt fails, second succeeds — so you can see how a task arc is laid out
+  across the tables.
+
+The generated `sample_muse.db` is not committed (it's a build artifact);
+run the script to create it. End-to-end development loop:
+
+```bash
+python3 sample/make_sample.py                              # build the sample db
+python3 bridge/extract_records.py --db sample/sample_muse.db --out records.json
+python3 bridge/build_otlp.py                               # records.json -> otlp.json
+python3 bin/send_trace.py otlp.json                        # optional: needs a Braintrust key
+```
+
+`bridge/extract_records.py` is the reference extractor: it pairs each
+`tool_call` context item with the `tool_output` that follows it, unwraps
+the JSON-string-encoded tool arguments, and joins token usage to the
+assistant messages it belongs to.
+
 ## Not included
 
-`records.json` / `otlp.json` are generated from real agent activity and are
-deliberately not committed.
+`records.json` / `otlp.json` from a real run are generated from actual agent
+activity and are deliberately not committed (the sample pipeline above
+produces synthetic equivalents).

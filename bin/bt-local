@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Run the telemetry CLI on this Mac against the real Braintrust API, for the
+# checks that do not need muse.db (check, probe, find). The API key is read
+# from the macOS keychain and never printed.
+#   One-time: security add-generic-password -s braintrust-api -a "$USER" -w
+#   Usage:    bin/bt-local check | probe --project SCRATCH_ID | find --marker TEXT
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+config="$root/local/config.json"
+[[ -f $config ]] || { echo "Create $config: {\"provider\": \"env\", \"projectId\": \"YOUR_PROJECT_ID\"}" >&2; exit 1; }
+key=$(security find-generic-password -s braintrust-api -w 2>/dev/null) || {
+  echo 'No key in the keychain. Run: security add-generic-password -s braintrust-api -a "$USER" -w' >&2; exit 1; }
+BRAINTRUST_API_KEY="$key" BRAINTRUST_TELEMETRY_STATE_DIR="$root/local/state" \
+  python3 "$root/skills/braintrust-telemetry/scripts/braintrust_telemetry.py" "$@" --config "$config"

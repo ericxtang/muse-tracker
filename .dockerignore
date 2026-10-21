@@ -1,0 +1,7 @@
+*
+!build.py
+!serve.py
+!docs/agent-setup.md
+!skills/**
+!VERSION
+!releases.json

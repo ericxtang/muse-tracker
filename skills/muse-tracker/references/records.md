@@ -70,7 +70,8 @@ Every export's own tool calls land in `muse.db` and would be exported in the
 next run, so telemetry keeps reporting on itself. If `muse.db` records which
 worker lane a call ran in (earlier exports saw lanes such as
 `event-hook:<hook id>` in `runtime.execute_resolve_runs`), filter out the
-`event-hook:braintrust-telemetry` lane in each query. Record the filter you used
+`event-hook:muse-tracker` lane in each query (and `event-hook:braintrust-telemetry`,
+this skill's hook id before 0.0.6, if it ever ran). Record the filter you used
 in `queries` so it is reviewed with them.
 
 ## What is known about muse.db
@@ -140,6 +141,7 @@ Children carry `span_parents: [<root span_id>]`; times are unix seconds.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
+| `destination` | `braintrust` | The observability tool to send to; `braintrust` is the only one supported so far |
 | `provider` | `muse` | `muse` uses the Secure Vault; `env` reads `BRAINTRUST_API_KEY` (local testing) |
 | `connector` | `custom.braintrust` | Vault connector name |
 | `helperPath` | built-in | Path to Muse's `dynamic_credentials.py` |
@@ -157,6 +159,6 @@ Children carry `span_parents: [<root span_id>]`; times are unix seconds.
 | `startAt` | none | Exact start for the first run, overriding `backfillDays` |
 
 State (watermark, run in progress, recently sent row hashes, task bounds, hook timer) lives in
-`~/hooks/state/braintrust-telemetry-<hash of config path>/`. Keep it across
+`~/hooks/state/muse-tracker-<hash of config path>/`. Keep it across
 updates. Deleting it re-sends everything from `startAt`, which replaces the
 same rows rather than duplicating them.

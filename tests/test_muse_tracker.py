@@ -1,4 +1,4 @@
-"""End-to-end tests for the braintrust-telemetry skill. Run: python3 -m unittest -v
+"""End-to-end tests for the muse-tracker skill. Run: python3 -m unittest -v
 
 A mock Braintrust keeps rows keyed by id, replacing on re-insert as the real
 insert API documents. A real SQLite file stands in for muse.db: direct mode
@@ -24,8 +24,8 @@ from unittest import mock
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILL_DIR = ROOT / "skills" / "braintrust-telemetry"
-CLI = SKILL_DIR / "scripts" / "braintrust_telemetry.py"
+SKILL_DIR = ROOT / "skills" / "muse-tracker"
+CLI = SKILL_DIR / "scripts" / "muse_tracker.py"
 sys.path.insert(0, str(ROOT))
 import build  # noqa: E402
 
@@ -154,7 +154,7 @@ class Base(unittest.TestCase):
         self.config_path.write_text(json.dumps(config))
 
     def cli(self, *args, script=CLI, expect=0):
-        env = {**os.environ, "BRAINTRUST_TELEMETRY_STATE_DIR": str(self.tmp / "state"),
+        env = {**os.environ, "MUSE_TRACKER_STATE_DIR": str(self.tmp / "state"),
                "BRAINTRUST_API_KEY": "test-key", "BRAINTRUST_API_URL": self.bt.url, "BRAINTRUST_BTQL_SPACING": "0"}
         proc = subprocess.run([sys.executable, str(script), *args, "--config", str(self.config_path)],
                               capture_output=True, text=True, env=env)
@@ -319,6 +319,44 @@ class Export(Base):
         state = self.state()
         self.assertEqual((state["watermark"], state["run"]), (watermark, None))
 
+    def test_migrate_carries_a_braintrust_telemetry_install_mid_run(self):
+        t0 = self.now - timedelta(days=2)
+        for i in range(12):
+            self.add_tool(f"t{i % 3}", i, t0 + timedelta(hours=i))
+        self.write_config(maxRows=5)
+        plan = self.cli("plan")
+        self.run_tool_queries(plan)
+        self.assertTrue(self.cli("export")["more"], "the old install stops mid-run")
+        sent_before = len(self.bt.sent())
+        # What a 0.0.5 install left behind: the same state under the old skill name.
+        old_dir = self.state_file().parent
+        legacy = old_dir.with_name(old_dir.name.replace("muse-tracker-", "braintrust-telemetry-"))
+        old_dir.rename(legacy)
+        old_config = self.config_path
+        self.config_path = self.tmp / "muse-tracker" / "config.json"
+        moved = self.cli("migrate", "--from", str(old_config))
+        self.assertIsNotNone(moved["runInProgress"])
+        config = json.loads(self.config_path.read_text())
+        self.assertEqual((config["destination"], config["projectId"]), ("braintrust", PROJECT))
+        self.assertNotIn("setupVersion", config, "an installed copy then reports every Setup change as required")
+        self.assertTrue((legacy / "migrated.json").exists())
+        self.assertEqual(self.cli("migrate", "--from", str(old_config), expect=6)["code"], "SETUP_ERROR", "runs once")
+
+        self.wake()
+        tools = self.bt.of_type("tool")
+        self.assertEqual(sorted(r["metadata"]["seq"] for r in tools), list(range(12)))
+        def tool_ids(events):
+            return [e["id"] for e in events if e["span_attributes"]["type"] == "tool"]
+        before, after = tool_ids(self.bt.sent()[:sent_before]), tool_ids(self.bt.sent()[sent_before:])
+        self.assertTrue(before)
+        self.assertEqual((len(before) + len(after), set(before) & set(after)), (12, set()),
+                         "calls sent before the move are not sent again")
+        self.assertIsNotNone(self.cli("status")["watermark"])
+
+    def test_unsupported_destination_is_refused(self):
+        self.write_config(destination="langfuse")
+        self.assertEqual(self.cli("plan", expect=6)["code"], "SETUP_ERROR")
+
     def test_page_cut_keeps_rows_that_share_the_boundary_timestamp(self):
         base = self.now - timedelta(hours=3)
         minutes = [0, 1, 2, 3, 3, 3, 4, 5]  # three rows share minute 3, which straddles a page of 4
@@ -348,8 +386,8 @@ class Export(Base):
         state_dir = self.tmp / "state"
         self.cli("status")
         key = hashlib.sha256(str(self.config_path.resolve()).encode()).hexdigest()[:16]
-        (state_dir / f"braintrust-telemetry-{key}").mkdir(parents=True, exist_ok=True)
-        (state_dir / f"braintrust-telemetry-{key}" / "export.json").write_text(json.dumps({"pageLimit": 5}))
+        (state_dir / f"muse-tracker-{key}").mkdir(parents=True, exist_ok=True)
+        (state_dir / f"muse-tracker-{key}" / "export.json").write_text(json.dumps({"pageLimit": 5}))
         self.run_tool_queries(self.cli("plan"))
         replan = self.cli("export", expect=3)
         self.assertEqual((replan["code"], replan["nextPageRows"]), ("REPLAN", 20))
@@ -604,7 +642,7 @@ class Hook(Base):
 
     def test_hook_skips_while_export_runs(self):
         key = hashlib.sha256(str(self.config_path.resolve()).encode()).hexdigest()[:16]
-        lock_dir = self.tmp / "state" / f"braintrust-telemetry-{key}"
+        lock_dir = self.tmp / "state" / f"muse-tracker-{key}"
         lock_dir.mkdir(parents=True)
         with (lock_dir / "export.lock").open("a") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
@@ -613,7 +651,7 @@ class Hook(Base):
     def test_shell_script_with_runtime(self):
         runtime = self.tmp / "runtime.sh"
         runtime.write_text('wake() { echo "WAKE|$1|$2"; exit 0; }\nsilent() { echo "SILENT|$1"; exit 0; }\nlog() { echo "LOG|$1" >&2; }\n')
-        env = {**os.environ, "HATCH_HOOK_RUNTIME": str(runtime), "BRAINTRUST_TELEMETRY_STATE_DIR": str(self.tmp / "state")}
+        env = {**os.environ, "HATCH_HOOK_RUNTIME": str(runtime), "MUSE_TRACKER_STATE_DIR": str(self.tmp / "state")}
         script = SKILL_DIR / "assets" / "export-hook.sh"
         out = [subprocess.run(["bash", str(script), str(self.config_path)], capture_output=True, text=True, env=env).stdout
                for _ in range(2)]
@@ -628,13 +666,13 @@ class Hook(Base):
 class Release(Base):
     def install(self, release):
         """Extract a built release the way setup.md does; returns the skill's CLI path."""
-        archive = (release / "skills" / "braintrust-telemetry.zip").read_bytes()
+        archive = (release / "skills" / "muse-tracker.zip").read_bytes()
         target = self.tmp / "install"
         with zipfile.ZipFile(io.BytesIO(archive)) as z:
-            self.assertEqual(sorted(z.namelist()), sorted("braintrust-telemetry/" + f for f in build.FILES))
+            self.assertEqual(sorted(z.namelist()), sorted("muse-tracker/" + f for f in build.FILES))
             z.extractall(target)
-        (target / "braintrust-telemetry/assets/export-hook.sh").chmod(0o755)
-        return target / "braintrust-telemetry" / "scripts" / "braintrust_telemetry.py"
+        (target / "muse-tracker/assets/export-hook.sh").chmod(0o755)
+        return target / "muse-tracker" / "scripts" / "muse_tracker.py"
 
     def newer_source(self, note):
         source = self.tmp / "source-v2"
@@ -650,10 +688,10 @@ class Release(Base):
         b = build.build(self.bt.url, self.tmp / "dist2")
         self.assertEqual(a["sha256"], b["sha256"])
         self.assertEqual(a["version"], (ROOT / "VERSION").read_text().strip())
-        self.assertTrue(a["archiveUrl"].endswith(f"/skills/braintrust-telemetry-{a['version']}-{a['sha256']}.zip"))
-        versioned = (self.tmp / "dist" / "skills" / f"braintrust-telemetry-{a['version']}-{a['sha256']}.zip").read_bytes()
+        self.assertTrue(a["archiveUrl"].endswith(f"/skills/muse-tracker-{a['version']}-{a['sha256']}.zip"))
+        versioned = (self.tmp / "dist" / "skills" / f"muse-tracker-{a['version']}-{a['sha256']}.zip").read_bytes()
         self.assertEqual(hashlib.sha256(versioned).hexdigest(), a["sha256"])
-        self.assertIn(self.bt.url, (self.tmp / "dist/skills/braintrust-telemetry/setup.md").read_text())
+        self.assertIn(self.bt.url, (self.tmp / "dist/skills/muse-tracker/setup.md").read_text())
 
     def test_released_version_matches_the_sources(self):
         """Fails when sources change without a VERSION bump and `build.py --release`."""
@@ -702,7 +740,7 @@ class Release(Base):
         self.assertEqual((info["installed"], info["latest"], info["upToDate"]), (v1["version"], "9.2.0", False))
 
         result = self.cli("self-update", script=cli)
-        self.assertEqual((result["updated"], result["changedFiles"], result["sha256"]), (True, ["SKILL.md", "scripts/braintrust_telemetry.py"], v2["sha256"]),
+        self.assertEqual((result["updated"], result["changedFiles"], result["sha256"]), (True, ["SKILL.md", "scripts/muse_tracker.py"], v2["sha256"]),
                          "the version is stamped into the CLI too")
         self.assertEqual((result["fromVersion"], result["version"]), (v1["version"], "9.2.0"))
         info = self.cli("version", script=cli)
@@ -750,7 +788,7 @@ class Release(Base):
         before = {p: p.read_bytes() for p in cli.parents[1].rglob("*") if p.is_file()}
         self.bt.static = self.tmp / "served"
         v2 = build.build(self.bt.url, self.bt.static, source=self.newer_source("release two"), version="9.2.0")
-        archive = self.bt.static / "skills" / f"braintrust-telemetry-9.2.0-{v2['sha256']}.zip"
+        archive = self.bt.static / "skills" / f"muse-tracker-9.2.0-{v2['sha256']}.zip"
         data = bytearray(archive.read_bytes())
         data[len(data) // 2] ^= 0xFF  # corrupt one byte in transit
         archive.write_bytes(bytes(data))
@@ -774,15 +812,15 @@ class Release(Base):
             import urllib.request
             for _ in range(50):
                 try:
-                    manifest = json.loads(urllib.request.urlopen(url + "/skills/braintrust-telemetry/manifest.json").read())
+                    manifest = json.loads(urllib.request.urlopen(url + "/skills/muse-tracker/manifest.json").read())
                     break
                 except OSError:
                     time.sleep(0.1)
             def cache(path):
                 with urllib.request.urlopen(url + path) as response:
                     return response.headers["Cache-Control"]
-            self.assertEqual(cache("/skills/braintrust-telemetry/manifest.json"), "no-store")
-            self.assertEqual(cache("/skills/braintrust-telemetry.zip"), "no-store")
+            self.assertEqual(cache("/skills/muse-tracker/manifest.json"), "no-store")
+            self.assertEqual(cache("/skills/muse-tracker.zip"), "no-store")
             self.assertIn("immutable", cache(manifest["archiveUrl"][len(url):]))
         finally:
             server.terminate()

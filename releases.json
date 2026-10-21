@@ -18,5 +18,9 @@
   "0.0.5": {
     "digest": "bdc2c8c9eee2e24b4415cd74cddf0c1a786d70fbdf9e63a41efeba70856fe133",
     "date": "2026-10-21"
+  },
+  "0.0.6": {
+    "digest": "12d27b0b70e88b156c9bc0ba26b14e7c8e4edacff885e771bc1fcff5d0f81250",
+    "date": "2026-10-21"
   }
 }

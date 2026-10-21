@@ -3,6 +3,19 @@
 Versions follow MAJOR.MINOR.PATCH. `releases.json` records the source digest of
 each version; the build refuses sources that do not match their version.
 
+## 0.0.6 — 2026-10-21
+
+- The skill is now **`muse-tracker`** (was `braintrust-telemetry`): new install
+  folder, config folder, hook id, CLI name (`scripts/muse_tracker.py`) and
+  release address (`/skills/muse-tracker/`).
+- `migrate --from OLD_CONFIG` carries a `braintrust-telemetry` install over,
+  config and export state included, so its export continues where it stopped
+  without duplicating rows. The setup guide runs it when it finds an old install.
+- The config's `destination` (default `braintrust`) names the observability
+  tool; Braintrust is the only one supported so far.
+- Setup version 3: saved queries leave out the new hook's own runs
+  (`event-hook:muse-tracker`).
+
 ## 0.0.5 — 2026-10-21
 
 - `setupRequired` no longer goes away after one `self-update`. The config

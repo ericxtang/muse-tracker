@@ -6,7 +6,7 @@ config=${1:?usage: export-hook.sh ABSOLUTE_CONFIG_PATH [--dry-run]}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 args=(hook --config "$config")
 if [[ ${2:-} == --dry-run || ${HATCH_HOOK_DRY_RUN:-0} == 1 ]]; then args+=(--dry-run); fi
-result=$(python3 "$script_dir/../scripts/braintrust_telemetry.py" "${args[@]}") || {
+result=$(python3 "$script_dir/../scripts/muse_tracker.py" "${args[@]}") || {
   log 'export check failed' "$result"
   silent 'export check failed; retry on the next invocation'
   exit 0

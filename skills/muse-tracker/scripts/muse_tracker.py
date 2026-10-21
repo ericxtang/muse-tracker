@@ -26,15 +26,15 @@ import uuid
 import zipfile
 
 BASE_URL = "{{BASE_URL}}"
-SKILL = "braintrust-telemetry"
+SKILL = "muse-tracker"
 VERSION = "{{VERSION}}"  # stamped by build.py from the repo's VERSION file
 SETUP_VERSION = "{{SETUP_VERSION}}"  # stamped by build.py; which Setup this release's SKILL.md describes
 API_URL = "https://api.braintrust.dev"
 API_HOST = "api.braintrust.dev"
 # Tests point provider env at a local server; the vault path always uses API_URL.
 API_OVERRIDE_OK = False
-BUNDLE_FILES = ("SKILL.md", "assets/export-hook.sh", "references/records.md", "scripts/braintrust_telemetry.py")
-EXECUTABLE_FILES = ("assets/export-hook.sh", "scripts/braintrust_telemetry.py")
+BUNDLE_FILES = ("SKILL.md", "assets/export-hook.sh", "references/records.md", "scripts/muse_tracker.py")
+EXECUTABLE_FILES = ("assets/export-hook.sh", "scripts/muse_tracker.py")
 MAX_ARCHIVE_BYTES = 5_000_000
 # The first path is the helper verified with custom.braintrust on 2026-10-20.
 HELPERS = ("/opt/muse/skills/custom-connector-setup/bin/dynamic_credentials.py",
@@ -44,7 +44,11 @@ REQUIRED_QUERIES = ("tool_calls", "model_calls")
 PARAM = re.compile(r":(since_iso|until_iso|since_ms|until_ms|limit)\b")
 DEFAULTS = {"intervalMinutes": 60, "overlapMinutes": 30, "settleMinutes": 0, "maxRows": 500,
             "maxAttributeChars": 8000, "maxPayloadBytes": 2_000_000, "maxPageBytes": 100_000,
-            "backfillDays": 7}
+            "backfillDays": 7, "destination": "braintrust"}
+# Observability tools this release can send to. The config's `destination` picks one.
+DESTINATIONS = ("braintrust",)
+# This skill's name before 0.0.6; `migrate` carries such an install over.
+LEGACY_SKILL = "braintrust-telemetry"
 # Tool mode passes every page through the agent's context, so its row limit
 # adapts to keep a page's rows near maxPageBytes (~25k tokens by default).
 TOOL_START_ROWS = 50
@@ -104,13 +108,17 @@ def load_config(path):
     config = read_json(path, None)
     if not isinstance(config, dict) or not config:
         raise Failure("SETUP_ERROR", "The config file is missing or is not a JSON object.", 6)
-    return path, {**DEFAULTS, **config}
+    config = {**DEFAULTS, **config}
+    if config["destination"] not in DESTINATIONS:
+        raise Failure("SETUP_ERROR", f"destination {config['destination']!r} is not supported yet; "
+                      "supported: " + ", ".join(DESTINATIONS) + ".", 6)
+    return path, config
 
 
-def state_dir(config_path):
+def state_dir(config_path, skill=SKILL):
     key = hashlib.sha256(str(config_path).encode()).hexdigest()[:16]
-    root = os.environ.get("BRAINTRUST_TELEMETRY_STATE_DIR", str(Path.home() / "hooks/state"))
-    return Path(root) / (SKILL + "-" + key)
+    root = os.environ.get("MUSE_TRACKER_STATE_DIR", str(Path.home() / "hooks/state"))
+    return Path(root) / (skill + "-" + key)
 
 
 class Locked:
@@ -1150,6 +1158,45 @@ def backfill(config_path, config, since_text, days, resend=False, only=None):
             "next": "run plan and export until more: false, as in On wake steps 3-4"}
 
 
+def migrate(config_path, old_config_path):
+    """Carry a braintrust-telemetry install (0.0.5 and earlier) over to this
+    skill: its config and its export state (watermark, run in progress, sent
+    rows), so the export continues where it stopped. Row ids do not depend on
+    the skill's name, so nothing already sent is duplicated."""
+    if not old_config_path:
+        raise Failure("INVALID_INPUT", "migrate needs --from /absolute/path/to/the/old/config.json.", 2)
+    old_path = Path(old_config_path).expanduser().resolve()
+    old = read_json(old_path, None)
+    if not isinstance(old, dict) or not old:
+        raise Failure("SETUP_ERROR", "The old config is missing or is not a JSON object.", 6)
+    new_path = Path(config_path).expanduser().resolve()
+    if new_path.exists():
+        raise Failure("SETUP_ERROR", "The new config already exists; migrate runs once, before any other setup.", 6)
+    old_dir, new_dir = state_dir(old_path, LEGACY_SKILL), state_dir(new_path)
+    if new_dir.exists() and any(new_dir.iterdir()):
+        raise Failure("SETUP_ERROR", "The new state directory is not empty; migrate runs once.", 6)
+    config = {k: v for k, v in old.items() if k != "setupReceipt"}
+    config.setdefault("destination", "braintrust")
+    state = {}
+    if old_dir.is_dir():
+        with Locked(old_dir):  # waits for an old export page still running
+            state = read_json(old_dir / "export.json")
+            new_dir.mkdir(parents=True, exist_ok=True)
+            os.chmod(new_dir, 0o700)
+            for name in ("export.json", "timer.json"):
+                if (old_dir / name).exists():
+                    atomic_json(new_dir / name, read_json(old_dir / name))
+            atomic_json(old_dir / "migrated.json", {"to": str(new_path), "at": now_ms()})
+    new_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    atomic_json(new_path, config)
+    run = state.get("run")
+    return {"ok": True, "config": str(new_path), "stateDir": str(new_dir), "from": str(old_path),
+            "watermark": iso(state["watermark"]) if state.get("watermark") else None,
+            "runInProgress": {"cursor": iso(run["cursor"]), "until": iso(run["until"])} if run else None,
+            "setupRequired": setup_required(config),
+            "next": "install this skill's hook, remove the braintrust-telemetry hook, then make the Setup changes"}
+
+
 def check(config):
     """Prove the key reaches the project without writing anything."""
     project = request_json(config, "GET", f"/v1/project/{project_id(config)}", retries=1)
@@ -1234,11 +1281,11 @@ def due_wake(directory, config_path, config, dry_run):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Muse → Braintrust telemetry. Every command prints one JSON object.")
-    parser.add_argument("command", choices=["version", "setup-check", "self-update", "setup-done", "check", "plan", "export", "status",
+    parser = argparse.ArgumentParser(description="Muse tracker: send Muse agent activity to an observability tool (Braintrust). Every command prints one JSON object.")
+    parser.add_argument("command", choices=["version", "setup-check", "self-update", "setup-done", "migrate", "check", "plan", "export", "status",
                                             "hook", "probe", "reconcile", "find", "backfill"])
     parser.add_argument("--version", action="version", version=VERSION, help="Print the installed version and exit")
-    parser.add_argument("--config", default=os.environ.get("BRAINTRUST_TELEMETRY_CONFIG"))
+    parser.add_argument("--config", default=os.environ.get("MUSE_TRACKER_CONFIG"))
     parser.add_argument("--attempt", help="Wake attemptId; recorded for traceability only")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output", help="With export --dry-run, write the events that would be sent here")
@@ -1251,6 +1298,7 @@ def main():
     parser.add_argument("--resend", action="store_true",
                         help="backfill: rebuild and re-send history already sent, up to the last export")
     parser.add_argument("--only", help="backfill: comma-separated queries to read, e.g. tasks")
+    parser.add_argument("--from", dest="from_config", help="migrate: the braintrust-telemetry config to carry over")
     args = parser.parse_args()
     if args.command == "version":
         return version_info()
@@ -1281,6 +1329,10 @@ def main():
         return result
     if args.command == "setup-done":
         return setup_done(load_config(args.config)[0])
+    if args.command == "migrate":
+        if not args.config:
+            raise Failure("SETUP_ERROR", "Pass --config with the new config path.", 6)
+        return migrate(args.config, args.from_config)
     path, config = load_config(args.config)
     global API_OVERRIDE_OK
     API_OVERRIDE_OK = config.get("provider") == "env"

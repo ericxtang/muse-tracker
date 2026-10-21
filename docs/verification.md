@@ -1,4 +1,4 @@
-# Verifying braintrust-telemetry
+# Verifying muse-tracker
 
 Seven phases, about 1.5 hours of your time spread over a week. Each step says
 what to do, what passing looks like, and what to stop on. Commands starting
@@ -50,7 +50,7 @@ I can read it. Messages in quotes go to Muse.
 ## 2. Onboard Muse
 
 1. In a Muse chat:
-   > Follow https://skill-production-44c7.up.railway.app/skills/braintrust-telemetry/setup.md to set up Braintrust telemetry.
+   > Follow https://skill-production-44c7.up.railway.app/skills/muse-tracker/setup.md to set up the Muse tracker.
 2. It should ask nothing when a working `custom.braintrust` card and a known
    project already exist. Otherwise it asks only to connect the card or for the
    project ID. **Pass:** no question about history (the past 7 days is the
@@ -71,7 +71,7 @@ I can read it. Messages in quotes go to Muse.
    | `upToDate: true`, `installed` = `latest` | `version` |
    | `projectName` is your project | `check` |
    | `watermark` set, `runInProgress: null`, `failure: null` | `status` |
-   | id `braintrust-telemetry`, enabled, poll 300 s, delivery = this chat, prompt names the skill and config paths | hook |
+   | id `muse-tracker`, enabled, poll 300 s, delivery = this chat, prompt names the skill and config paths | hook |
    | Rows from your history appear under Logs | Braintrust |
 5. **Failure paths** (optional, 5 min): paste a fake key into chat (it must
    refuse to use it), and give a wrong project ID once (`check` must fail with
@@ -83,7 +83,7 @@ I can read it. Messages in quotes go to Muse.
    In Muse:
    > Run exactly these three shell commands, one at a time: `echo canary-1021-qzx A`, `echo canary-1021-qzx B`, `ls /canary-1021-qzx-missing`. Then reply "done".
 2. Then:
-   > Run the Braintrust telemetry export now (On wake).
+   > Run the Muse tracker export now (On wake).
 3. Locally:
    ```
    ! bin/bt-local find --marker canary-1021-qzx
@@ -108,7 +108,7 @@ I can read it. Messages in quotes go to Muse.
 
 1. In Muse, for the history sent so far (use 6-hour ranges if it reports
    `RANGE_TOO_LARGE`):
-   > Run braintrust telemetry reconcile with --since 2026-10-14T00:00:00Z --until 2026-10-21T00:00:00Z and show me the result.
+   > Run the Muse tracker reconcile with --since 2026-10-14T00:00:00Z --until 2026-10-21T00:00:00Z and show me the result.
 
    **Pass:** `missing`, `extra`, `duplicates` and `mismatched` are all 0, and
    the `expected` token totals equal `stored`.
@@ -130,13 +130,13 @@ affected time.
 | **Revoke the key** in Braintrust. Wait for the next hourly export. | Exactly one message about the key. Later wakes stay silent (`status` → `failure.count` grows, wakes slow to at most daily). Reconnect the card as the message says: the next export catches up and reconcile is clean. |
 | **Interrupt a run.** Ask "Run the export now", then press stop while it is paging. | `status` shows `runInProgress`. About 15 minutes after the last page, the hook resumes it and `runInProgress` returns to `null`. |
 | **Lose local state.** Ask Muse to delete the directory `status` reports as `stateDir`, then run the export. | It re-sends the past 7 days. Reconcile: `duplicates: 0`. |
-| **Ask for older history.** "Send my Braintrust telemetry from the past 30 days." | Muse estimates the pages, runs `backfill --days 30` and pages through it; `status` → `historyFrom` moves back 30 days; reconcile over days 8–30 is clean, and the hourly export keeps running. |
+| **Ask for older history.** "Send my Muse activity from the past 30 days to Braintrust." | Muse estimates the pages, runs `backfill --days 30` and pages through it; `status` → `historyFrom` moves back 30 days; reconcile over days 8–30 is clean, and the hourly export keeps running. |
 | **Ship an update.** Tell me "release 0.0.5". | At the next wake the hook reports `installedVersion` 0.0.4 → `latestVersion` 0.0.5. Muse updates itself, `version` says `upToDate: true`, and exports continue. |
 
 ## 6. Soak (7 days)
 
 Once a day, ask Muse:
-> Show braintrust telemetry `status`.
+> Show the Muse tracker `status`.
 
 | Signal | Pass |
 | --- | --- |

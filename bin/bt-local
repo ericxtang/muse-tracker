@@ -10,5 +10,5 @@ config="$root/local/config.json"
 [[ -f $config ]] || { echo "Create $config: {\"provider\": \"env\", \"projectId\": \"YOUR_PROJECT_ID\"}" >&2; exit 1; }
 key=$(security find-generic-password -s braintrust-api -w 2>/dev/null) || {
   echo 'No key in the keychain. Run: security add-generic-password -s braintrust-api -a "$USER" -w' >&2; exit 1; }
-BRAINTRUST_API_KEY="$key" BRAINTRUST_TELEMETRY_STATE_DIR="$root/local/state" \
-  python3 "$root/skills/braintrust-telemetry/scripts/braintrust_telemetry.py" "$@" --config "$config"
+BRAINTRUST_API_KEY="$key" MUSE_TRACKER_STATE_DIR="$root/local/state" \
+  python3 "$root/skills/muse-tracker/scripts/muse_tracker.py" "$@" --config "$config"

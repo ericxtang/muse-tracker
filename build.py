@@ -10,9 +10,9 @@ from what their version recorded: change anything, bump VERSION, run --release.
 
 Layout matches the Let's Swap skill routes, plus a content-addressed archive
 that the manifest points at, so a cached archive can never pass for a newer one:
-    skills/braintrust-telemetry.zip              (latest, for people)
-    skills/braintrust-telemetry-<version>-<sha256>.zip  (immutable; manifest.archiveUrl)
-    skills/braintrust-telemetry/{manifest.json,SKILL.md,setup.md}
+    skills/muse-tracker.zip              (latest, for people)
+    skills/muse-tracker-<version>-<sha256>.zip  (immutable; manifest.archiveUrl)
+    skills/muse-tracker/{manifest.json,SKILL.md,setup.md}
 """
 import argparse
 from datetime import date
@@ -25,11 +25,11 @@ import shutil
 import zipfile
 
 ROOT = Path(__file__).resolve().parent
-SKILL = "braintrust-telemetry"
-FILES = ("SKILL.md", "assets/export-hook.sh", "references/records.md", "scripts/braintrust_telemetry.py")
-EXECUTABLE = {"assets/export-hook.sh", "scripts/braintrust_telemetry.py"}
+SKILL = "muse-tracker"
+FILES = ("SKILL.md", "assets/export-hook.sh", "references/records.md", "scripts/muse_tracker.py")
+EXECUTABLE = {"assets/export-hook.sh", "scripts/muse_tracker.py"}
 # Bump when an update requires installed agents to repeat setup.
-SETUP_VERSION = 2
+SETUP_VERSION = 3
 
 
 SEMVER = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")

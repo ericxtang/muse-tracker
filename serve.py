@@ -53,7 +53,7 @@ def main():
             if path in table:
                 self.send(200, *table[path], head=head, immutable=path == immutable_path)
             elif path == "/":
-                self.send(200, f"Braintrust telemetry skill for Muse, version {manifest['version']}.\nSetup guide: ".encode() + setup, "text/plain", head=head)
+                self.send(200, f"Muse tracker skill, version {manifest['version']}.\nSetup guide: ".encode() + setup, "text/plain", head=head)
             else:
                 self.send(404, b"not found\n", "text/plain", head=head)
 

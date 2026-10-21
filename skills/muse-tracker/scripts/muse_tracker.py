@@ -45,7 +45,8 @@ REQUIRED_QUERIES = ("tool_calls", "model_calls")
 PARAM = re.compile(r":(since_iso|until_iso|since_ms|until_ms|limit)\b")
 DEFAULTS = {"intervalMinutes": 60, "overlapMinutes": 30, "settleMinutes": 0, "maxRows": 500,
             "maxAttributeChars": 8000, "maxPayloadBytes": 2_000_000, "maxPageBytes": 100_000,
-            "backfillDays": 7, "destination": "braintrust", "rootSettleMinutes": 120}
+            "backfillDays": 7, "destination": "braintrust", "rootSettleMinutes": 120,
+            "langfuseReadWindowDays": 30, "langfuseReadSpacingSeconds": 2.1, "langfuseVisibilitySeconds": 30}
 # Observability tools this release can send to. The config's `destination` picks one.
 DESTINATIONS = ("braintrust", "langfuse")
 # This skill's name before 0.0.6; `migrate` carries such an install over.
@@ -605,10 +606,12 @@ def langfuse_authorize(request, config):
     provider = config.get("provider", "muse")
     if provider == "env":
         public, secret = os.environ.get("LANGFUSE_PUBLIC_KEY", ""), os.environ.get("LANGFUSE_SECRET_KEY", "")
-        if not public or not secret:
-            raise Failure("SETUP_ERROR", "Set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY for provider env.", 6)
-        token = base64.b64encode(f"{public}:{secret}".encode()).decode()
-        request.add_header("Authorization", "Basic " + token)
+        if not secret:
+            raise Failure("SETUP_ERROR", "Set LANGFUSE_SECRET_KEY (and LANGFUSE_PUBLIC_KEY for Basic auth) for provider env.", 6)
+        if public:
+            request.add_header("Authorization", "Basic " + base64.b64encode(f"{public}:{secret}".encode()).decode())
+        else:  # the form a Muse api_key card sends: the secret key as a bearer token
+            request.add_header("Authorization", "Bearer " + secret)
         return
     if provider != "muse":
         raise Failure("SETUP_ERROR", "provider must be muse or env.", 6)
@@ -619,6 +622,9 @@ def langfuse_authorize(request, config):
         module.add_surrogate_to_request(request, config.get("connector") or "custom.langfuse", allowed_hosts=[host])
     except Exception:
         raise Failure("VAULT_UNAVAILABLE", "Could not obtain the Langfuse credential from the Secure Vault.", 6)
+
+
+LAST_READ = [0.0]
 
 
 def langfuse_request(config, method, path, body=None, query=None, write=False, retries=4):
@@ -632,6 +638,12 @@ def langfuse_request(config, method, path, body=None, query=None, write=False, r
         headers["x-langfuse-ingestion-version"] = "4"
     opener = urllib.request.build_opener(NoRedirect())
     for n in range(retries + 1):
+        if not write:
+            spacing = float(config.get("langfuseReadSpacingSeconds") or 0)
+            wait = LAST_READ[0] + spacing - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            LAST_READ[0] = time.monotonic()
         request = urllib.request.Request(url, data=data, method=method, headers=headers)
         langfuse_authorize(request, config)
         try:
@@ -776,20 +788,39 @@ def langfuse_observations(config, query):
 
 
 def langfuse_existing(config, spans):
-    """Span ids Langfuse already holds, checked per trace within the spans' time range."""
-    by_trace = {}
-    for s in spans:
-        by_trace.setdefault(s["root_span_id"], []).append(start_ms(s))
+    """Span ids Langfuse already holds among these spans. One paged query over
+    their time range, filtered by this agent's tag: a few reads per page
+    however many traces it touches. Start times are clustered (a page's
+    children share its window; held roots are read in their own range)."""
+    starts = sorted(start_ms(s) for s in spans)
+    groups, current = [], [starts[0]]
+    for t in starts[1:]:
+        if t - current[0] > 6 * 3_600_000:  # keep each query's range bounded
+            groups.append(current)
+            current = []
+        current.append(t)
+    groups.append(current)
+    oldest = now_ms() - int(config["langfuseReadWindowDays"]) * 86_400_000
+    if starts[0] < oldest:
+        raise Failure("CANNOT_VERIFY", "Some spans are older than Langfuse's read window "
+                      f"(langfuseReadWindowDays {config['langfuseReadWindowDays']}), so it cannot tell whether "
+                      "they were already sent. Nothing was sent.", 2)
+    tag = json.dumps([{"type": "arrayOptions", "column": "tags", "operator": "any of", "value": [agent_tag(config)]}])
     found = set()
-    for trace, starts in by_trace.items():
-        rows = langfuse_observations(config, {"traceId": trace, "fromStartTime": iso(min(starts) - 60_000),
-                                              "toStartTime": iso(max(starts) + 60_000)})
+    for group in groups:
+        rows = langfuse_observations(config, {"filter": tag, "fromStartTime": iso(group[0] - 60_000),
+                                              "toStartTime": iso(group[-1] + 60_000)})
         found |= {r.get("id") for r in rows}
-    return found
+    wanted = {s["span_id"] for s in spans}
+    return found & wanted
 
 
 def langfuse_has_agent_spans(config, since, until):
-    """Does Langfuse already hold any of this agent's spans in the window? One request."""
+    """Does Langfuse already hold any of this agent's spans in the window? One
+    request, limited to the plan's read window (older data is hidden from reads)."""
+    since = max(since, now_ms() - int(config["langfuseReadWindowDays"]) * 86_400_000)
+    if since >= until:
+        return False
     query = {"filter": json.dumps([{"type": "arrayOptions", "column": "tags", "operator": "any of",
                                     "value": [agent_tag(config)]}]),
              "fromStartTime": iso(since), "toStartTime": iso(until), "fields": "core", "limit": 1}
@@ -1168,9 +1199,16 @@ def export_page(directory, config, queries, dry_run, output):
                 # A regular run follows the registry. Any other run (the first,
                 # after lost state, or a backfill) may repeat earlier sends:
                 # one request asks whether Langfuse already has this agent's spans.
-                run["langfuseCheck"] = bool(run.get("backfill") or state.get("watermark") is None) and \
+                run["langfuseCheck"] = not run.get("unverified") and \
+                    bool(run.get("backfill") or state.get("watermark") is None) and \
                     langfuse_has_agent_spans(config, run["since"], run["until"])
             check = [span for span in fresh if run["langfuseCheck"] or span["root_span_id"] in uncertain]
+            if check and uncertain:
+                # A batch Langfuse may have stored takes a few seconds to become
+                # readable; checking sooner would miss it and send it again.
+                wait = (state.get("uncertainAt") or 0) / 1000 + float(config["langfuseVisibilitySeconds"]) - time.time()
+                if wait > 0:
+                    time.sleep(min(wait, 120))
             if check:
                 have = langfuse_existing(config, check)
                 for span in check:
@@ -1183,7 +1221,20 @@ def export_page(directory, config, queries, dry_run, output):
         fresh = [span for span in spans if sent.get(span_key(span)) != span_digest(span)]
         # A span already sent with identical content is skipped; a changed one (a
         # task root whose bounds grew) is sent again under the same id.
-    batches = chunks(fresh, int(config["maxPayloadBytes"]))
+    if langfuse(config):
+        sized = [(span, otlp_span(span, contexts[span["root_span_id"]])) for span in fresh]
+        batches, current, size = [], [], 0
+        for span, converted in sized:
+            n = len(json.dumps(converted, ensure_ascii=False).encode())
+            if current and size + n > min(int(config["maxPayloadBytes"]), 4_000_000):
+                batches.append(current)
+                current, size = [], 0
+            current.append(span)
+            size += n
+        if current:
+            batches.append(current)
+    else:
+        batches = chunks(fresh, int(config["maxPayloadBytes"]))
     if dry_run:
         if output:
             atomic_json(Path(output), preview(config, fresh))
@@ -1203,6 +1254,7 @@ def export_page(directory, config, queries, dry_run, output):
             if failure.payload["code"] == "SEND_UNCERTAIN":
                 # Langfuse may have stored this batch: the retry checks these traces first.
                 state["uncertain"] = sorted(set(state.get("uncertain") or []) | {span["root_span_id"] for span in batch})
+                state["uncertainAt"] = now_ms()
                 atomic_json(directory / "export.json", state)
             raise
         # Record each request as it lands, so a retry after a partial send skips it.
@@ -1458,7 +1510,7 @@ def probe(config, scratch_project, wait_seconds=120):
             "rowsSeen": len(rows), "trace": trace}
 
 
-def backfill(config_path, config, since_text, days, resend=False, only=None):
+def backfill(config_path, config, since_text, days, resend=False, only=None, beyond_read_window=False):
     """Queue older history: everything from `since` up to what is already sent.
     With resend, everything from `since` up to the last export instead, so rows
     already sent are rebuilt with the current queries and replaced in place.
@@ -1481,13 +1533,20 @@ def backfill(config_path, config, since_text, days, resend=False, only=None):
         if state.get("run"):
             raise Failure("BUSY", "An export is in progress; finish it (plan/export until more: false), then backfill.", 3)
         since = to_ms(since_text) if since_text else now_ms() - int(days) * 86_400_000
+        window = int(config["langfuseReadWindowDays"])
+        if langfuse(config) and since < now_ms() - window * 86_400_000 and not beyond_read_window:
+            raise Failure("BEYOND_READ_WINDOW", f"Langfuse can read back only the last {window} days on this plan "
+                          "(langfuseReadWindowDays), so it cannot check whether older history was already sent, and "
+                          "on Hobby it would not be visible. Run with --beyond-read-window only if this history was "
+                          "never sent to this project.", 2, readWindowDays=window)
         until = state["watermark"] if resend else covered
         if since >= until:
             return {"ok": True, "due": False, "reason": f"history from {iso(covered)} is already sent"}
         now = now_ms()
         state["run"] = {"since": since, "until": until, "cursor": since, "pages": 0, "spans": 0, "sentSpans": 0,
                         "startedAt": now, "touchedAt": now, "backfill": True,
-                        **({"only": sorted(only)} if only else {}), **({"resend": True} if resend else {})}
+                        **({"only": sorted(only)} if only else {}), **({"resend": True} if resend else {}),
+                        **({"unverified": True} if beyond_read_window and langfuse(config) else {})}
         atomic_json(directory / "export.json", state)
     return {"ok": True, "due": True, "window": window_json({"since": since, "until": until}),
             **({"only": sorted(only)} if only else {}),
@@ -1637,6 +1696,8 @@ def main():
                         help="backfill: rebuild and re-send history already sent, up to the last export")
     parser.add_argument("--only", help="backfill: comma-separated queries to read, e.g. tasks")
     parser.add_argument("--from", dest="from_config", help="migrate: the braintrust-telemetry config to carry over")
+    parser.add_argument("--beyond-read-window", action="store_true",
+                        help="backfill (Langfuse): send history older than the plan's read window, unchecked")
     args = parser.parse_args()
     if args.command == "version":
         return version_info()
@@ -1696,7 +1757,7 @@ def main():
         if args.resend and langfuse(config):
             raise Failure("NOT_SUPPORTED", "Langfuse stores every write, so a resend would duplicate rows. "
                           "To redo traces, delete them in Langfuse first, then backfill.", 2)
-        return backfill(path, config, args.since, args.days, args.resend, only)
+        return backfill(path, config, args.since, args.days, args.resend, only, args.beyond_read_window)
     return hook(path, config, args.dry_run)
 
 

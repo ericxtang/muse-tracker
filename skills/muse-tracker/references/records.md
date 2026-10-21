@@ -151,7 +151,10 @@ Children carry `span_parents: [<root span_id>]`; times are unix seconds.
 ### Langfuse
 
 Spans go as OTLP/HTTP JSON to `<langfuseHost>/api/public/otel/v1/traces` with
-`x-langfuse-ingestion-version: 4` and Basic auth (public key : secret key). The
+`x-langfuse-ingestion-version: 4`. Auth is `Authorization: Bearer <secret key>`
+(what a Muse `api_key` card sends; Langfuse v4 resolves a bearer secret key to
+full project access) or `Basic base64(public:secret)`. A bearer *public* key
+only reaches scores and is refused for traces. The
 trace id and span ids are the same as for Braintrust (32 and 16 hex characters),
 so a task is one Langfuse trace.
 
@@ -180,15 +183,28 @@ with the same id is stored again ([docs](https://langfuse.com/faq/all/tracing-da
   children of the same root, but the root's own end time does not move.
 - A run that may repeat earlier sends (the first run, after lost state, or a
   backfill) asks Langfuse once whether it already holds this agent's spans in
-  the window; if so, each trace is checked before sending.
+  the window; if so, every page is checked before sending. A check is one paged
+  query over the page's time range filtered by the `muse-agent:<agentId>` tag,
+  so it costs a few reads however many traces the page touches.
 - A write that fails without an answer (5xx, timeout) may have been stored: the
-  page fails with `SEND_UNCERTAIN`, and its retry checks those traces first.
+  page fails with `SEND_UNCERTAIN`, and its retry checks those traces first,
+  after waiting until the failed send is `langfuseVisibilitySeconds` (30) old:
+  Langfuse makes new spans readable a few seconds after accepting them.
 - `backfill --resend` is refused; to redo traces, delete them in Langfuse first.
   `reconcile`, `find` and `probe` read back from Braintrust only.
 
-Plan limits to know ([limits](https://langfuse.com/faq/all/api-limits)): Hobby
-shows 30 days of data (older data is kept but hidden), allows 1,000 ingestion
-requests and 30 reads a minute, and 50 delete requests a day.
+**Plan limits** ([limits](https://langfuse.com/faq/all/api-limits)) and how the
+export stays inside them:
+
+| Limit (Hobby) | Effect | What the export does |
+| --- | --- | --- |
+| 30 reads a minute | Existence checks could be throttled | Checks are one query per page window, not per trace; reads are spaced `langfuseReadSpacingSeconds` (2.1) apart; a 429 waits for `Retry-After` |
+| Reads and the UI cover the last 30 days | Older spans can't be checked for duplicates, and aren't shown | A backfill older than `langfuseReadWindowDays` (30) needs `--beyond-read-window`, meaning "never sent to this project"; checks never reach past the window |
+| 1,000 ingestion requests a minute; 5 MB a request | Large batches refused | Batches are sized on the OTLP body, at most 4 MB; a 429 is retried |
+| 50 deletes a day | — | The export never deletes |
+
+On Core (90 days) or Pro (3 years), raise `langfuseReadWindowDays` and lower
+`langfuseReadSpacingSeconds` to match the plan.
 
 ## Config
 
@@ -197,6 +213,9 @@ requests and 30 reads a minute, and 50 delete requests a day.
 | `destination` | `braintrust` | The observability tool to send to: `braintrust` or `langfuse` |
 | `langfuseHost` | `https://cloud.langfuse.com` | Langfuse origin (`us.`, `jp.`, `hipaa.` cloud regions, or self-hosted) |
 | `rootSettleMinutes` | 120 | Langfuse: how long a task must be idle before its root is sent |
+| `langfuseReadWindowDays` | 30 | Langfuse: how far back the plan lets reads (and the UI) see |
+| `langfuseReadSpacingSeconds` | 2.1 | Langfuse: minimum time between reads (Hobby allows 30 a minute) |
+| `langfuseVisibilitySeconds` | 30 | Langfuse: how long to wait before checking a send that failed without an answer |
 | `userId`, `environment` | none | Langfuse: sent as the trace's user and environment |
 | `provider` | `muse` | `muse` uses the Secure Vault; `env` reads `BRAINTRUST_API_KEY` (local testing) |
 | `connector` | `custom.braintrust` | Vault connector name |

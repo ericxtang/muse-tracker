@@ -2,6 +2,12 @@
 """End-to-end run of a released muse-tracker against mock backends.
 
     python3 tests/e2e.py [--report PATH]
+    LIVE_LANGFUSE_PUBLIC_KEY=… LIVE_LANGFUSE_SECRET_KEY=… \
+        python3 tests/e2e.py --langfuse-live http://localhost:3000
+
+With --langfuse-live, the Langfuse phases run against that real server through
+a stand-in for Muse's Secure Vault (tests/live_langfuse.py): the CLI runs with
+provider "muse" and only ever holds a surrogate.
 
 It builds a release, publishes it to a mock GitHub (with the latest/download
 redirect), installs it the way setup.md does, and drives the installed CLI the
@@ -165,21 +171,36 @@ def seed(db):
 
 
 class Run:
-    def __init__(self, report):
-        self.report, self.failed = report, 0
+    def __init__(self, report, live=None):
+        self.report, self.failed, self.live = report, 0, live
         self.tmp = Path(tempfile.mkdtemp(prefix="muse-tracker-e2e-"))
         self.github = Braintrust(static=self.tmp / "github")   # serves releases (and doubles as Braintrust)
         self.bt = self.github
-        self.lf = Langfuse()
+        if live:
+            import live_langfuse
+            self.secret = os.environ["LIVE_LANGFUSE_SECRET_KEY"]
+            self.vault = live_langfuse.VaultProxy(self.tmp / "vault", live, self.secret)
+            # A real server keeps earlier runs' spans: give this run its own agent (trace ids derive from it).
+            self.agent = "muse-e2e-" + __import__("uuid").uuid4().hex[:8]
+            self.lf = live_langfuse.RealLangfuse(live, os.environ["LIVE_LANGFUSE_PUBLIC_KEY"], self.secret, self.vault,
+                                                 agent_tag=f"muse-agent:{self.agent}")
+        else:
+            self.agent = "muse-e2e"
+            self.lf = Langfuse()
 
     def check(self, phase, what, ok, evidence):
         self.failed += not ok
         self.report.append(f"| {phase} | {what} | {'PASS' if ok else '**FAIL**'} | {evidence} |")
 
     def env(self, state):
-        return {**os.environ, "MUSE_TRACKER_STATE_DIR": str(state), "BRAINTRUST_API_KEY": "test-key",
-                "BRAINTRUST_API_URL": self.bt.url, "BRAINTRUST_BTQL_SPACING": "0", "LANGFUSE_HOST": self.lf.url,
-                "LANGFUSE_PUBLIC_KEY": "pk-test", "LANGFUSE_SECRET_KEY": "sk-test"}
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("LANGFUSE_", "LIVE_LANGFUSE_"))}
+        env.update(MUSE_TRACKER_STATE_DIR=str(state), BRAINTRUST_API_KEY="test-key", BRAINTRUST_API_URL=self.bt.url,
+                   BRAINTRUST_BTQL_SPACING="0")
+        if self.live:  # Muse's way: egress through the vault proxy, which trusts its own CA
+            env.update(HTTPS_PROXY=self.vault.url, SSL_CERT_FILE=str(self.vault.ca), NO_PROXY="127.0.0.1")
+        else:
+            env.update(LANGFUSE_HOST=self.lf.url, LANGFUSE_PUBLIC_KEY="pk-test", LANGFUSE_SECRET_KEY="sk-test")
+        return env
 
     def cli(self, config, *args, state=None, expect=0):
         proc = subprocess.run([sys.executable, str(self.script), *args, "--config", str(config)], capture_output=True,
@@ -210,9 +231,10 @@ class Run:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--report", default=str(Path(tempfile.gettempdir()) / "muse-tracker-e2e.md"))
+    parser.add_argument("--langfuse-live", metavar="URL", help="run the Langfuse phases against this real server")
     args = parser.parse_args()
     report = ["| Phase | Check | Result | Evidence |", "| --- | --- | --- | --- |"]
-    run = Run(report)
+    run = Run(report, args.langfuse_live)
     samples = {}
     try:
         # 1. Release and install, as setup.md does it.
@@ -239,9 +261,16 @@ def main():
         for dest in ("braintrust", "langfuse"):
             config = run.tmp / dest / "config.json"
             config.parent.mkdir()
-            base = {"provider": "env", "agentId": "muse-e2e", "destination": dest, "queries": queries, "maxRows": 5,
+            base = {"provider": "env", "agentId": run.agent, "destination": dest, "queries": queries, "maxRows": 5,
                     "setupVersion": build.SETUP_VERSION}
-            base.update({"projectId": PROJECT} if dest == "braintrust" else {"rootSettleMinutes": 30})
+            if dest == "braintrust":
+                base["projectId"] = PROJECT
+            else:
+                base.update(rootSettleMinutes=30, langfuseReadSpacingSeconds=0, langfuseVisibilitySeconds=10)
+                if run.live:
+                    import live_langfuse
+                    base.update(provider="muse", connector="custom.langfuse", helperPath=str(run.vault.helper),
+                                langfuseHost=f"https://{live_langfuse.HOST}")
             config.write_text(json.dumps(base))
             configs[dest] = config
             run.cli(config, "setup-check")
@@ -404,6 +433,15 @@ def main():
                   run.cli(configs["langfuse"], "backfill", "--resend", "--days", "7", expect=2)["code"] == "NOT_SUPPORTED",
                   "NOT_SUPPORTED")
 
+        if run.live:
+            leaked = [str(f) for f in run.tmp.rglob("*") if f.is_file() and f.suffix in (".json", ".py", ".md", "")
+                      and run.secret.encode() in f.read_bytes()]
+            run.check("Vault", "every Langfuse request went through the vault stand-in with a surrogate",
+                      run.vault.swaps > 0 and run.vault.refused == 0,
+                      f"{run.vault.swaps} surrogates swapped, {run.vault.refused} requests refused")
+            run.check("Vault", "the secret key never appears in config, state or helper files", not leaked,
+                      "0 files contain it" if not leaked else ", ".join(leaked[:3]))
+
         # 9. Update: a newer release on the mock GitHub reaches the install.
         source = run.tmp / "source-next"
         shutil.copytree(ROOT / "skills" / "muse-tracker", source)
@@ -424,8 +462,10 @@ def main():
         run.lf.close()
 
     passed = sum(1 for line in report[2:] if "| PASS |" in line)
+    where = f"real Langfuse at {args.langfuse_live} via the vault stand-in" if args.langfuse_live else "mock Langfuse"
     text = [f"# muse-tracker end-to-end run", "",
-            f"{NOW.isoformat()} · release {build.current_version()} · {passed}/{len(report) - 2} checks passed", ""] + report
+            f"{NOW.isoformat()} · release {build.current_version()} · Braintrust: mock · Langfuse: {where} · "
+            f"{passed}/{len(report) - 2} checks passed", ""] + report
     for dest, rows in samples.items():
         text += ["", f"## Sample: the subagent's trace as stored by mock {dest.capitalize()}", "", "```json",
                  json.dumps(trim(rows), indent=1, ensure_ascii=False)[:6000], "```"]

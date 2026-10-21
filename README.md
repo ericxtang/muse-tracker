@@ -72,8 +72,8 @@ read-back commands (`reconcile`, `find`, `probe`) exist for Braintrust only.
    metrics for token counts.
 3. **An API key** that a Secure Vault card can hold, restricted to the tool's
    API host. Muse never sees the key; the vault adds it to each request.
-   Langfuse uses a key pair over Basic auth; whether Muse's vault offers a
-   Basic-auth card is not yet confirmed on a live Muse.
+   Langfuse v4 accepts its secret key as a bearer token, so a standard Muse
+   `api_key` card works; Setup falls back to a card carrying a `Basic` header.
 4. **A way to read rows back** by id or trace, so `reconcile` can compare what
    `muse.db` holds with what the tool stored. Optional, but without it a
    destination cannot be verified.
@@ -172,6 +172,15 @@ python3 sample/make_sample.py      # writes sample/sample_muse.db (not committed
 python3 -m unittest discover -s tests -v
 python3 tests/e2e.py                 # end-to-end run of a built release; prints a report
 ```
+
+With `--langfuse-live URL` (and `LIVE_LANGFUSE_PUBLIC_KEY` / `LIVE_LANGFUSE_SECRET_KEY`),
+the Langfuse phases run against a real server instead, through a stand-in for
+Muse's Secure Vault (`tests/live_langfuse.py`): the CLI runs with provider
+`muse` and holds only a surrogate, and a TLS-intercepting proxy swaps in the
+secret, as Muse's egress proxy does. A local server takes one command:
+`docker compose up` with Langfuse's
+[compose file](https://github.com/langfuse/langfuse/blob/main/docker-compose.yml)
+and its `LANGFUSE_INIT_*` variables.
 
 `tests/e2e.py` builds a release, publishes it to a mock GitHub, installs it as
 `setup.md` does, and drives the installed CLI the way a Muse worker does

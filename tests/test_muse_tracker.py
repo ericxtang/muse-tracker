@@ -129,7 +129,7 @@ class Langfuse:
     """Mock Langfuse: OTLP ingestion that, like the real one, keeps every write
     (a span sent twice is stored twice), plus the v2 observations read."""
 
-    AUTH = "Basic " + __import__("base64").b64encode(b"pk-test:sk-test").decode()
+    AUTH = ("Basic " + __import__("base64").b64encode(b"pk-test:sk-test").decode(), "Bearer sk-test")
 
     def __init__(self):
         self.spans, self.posts, self.gets = [], [], []
@@ -148,7 +148,7 @@ class Langfuse:
                 self.wfile.write(data)
 
             def do_GET(self):
-                if self.headers.get("Authorization") != outer.AUTH:
+                if self.headers.get("Authorization") not in outer.AUTH:
                     return self.reply(401, {"error": "unauthorized"})
                 route, _, raw = self.path.partition("?")
                 query = dict(urllib.parse.parse_qsl(raw))
@@ -171,7 +171,7 @@ class Langfuse:
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                if self.headers.get("Authorization") != outer.AUTH:
+                if self.headers.get("Authorization") not in outer.AUTH:
                     return self.reply(401, {"error": "unauthorized"})
                 if self.path != "/api/public/otel/v1/traces" or self.headers.get("x-langfuse-ingestion-version") != "4":
                     return self.reply(400, {"error": "bad request"})
@@ -253,7 +253,9 @@ class Base(unittest.TestCase):
         env = {**os.environ, "MUSE_TRACKER_STATE_DIR": str(self.tmp / "state"),
                "BRAINTRUST_API_KEY": "test-key", "BRAINTRUST_API_URL": self.bt.url, "BRAINTRUST_BTQL_SPACING": "0"}
         if getattr(self, "lf", None):
-            env.update(LANGFUSE_HOST=self.lf.url, LANGFUSE_PUBLIC_KEY="pk-test", LANGFUSE_SECRET_KEY="sk-test")
+            env.update(LANGFUSE_HOST=self.lf.url, LANGFUSE_SECRET_KEY="sk-test")
+            if not getattr(self, "lf_secret_only", False):
+                env["LANGFUSE_PUBLIC_KEY"] = "pk-test"
         proc = subprocess.run([sys.executable, str(script), *args, "--config", str(self.config_path)],
                               capture_output=True, text=True, env=env)
         self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
@@ -798,8 +800,9 @@ class LangfuseExport(Base):
         super().tearDown()
 
     def write_config(self, **extra):
-        super().write_config(destination="langfuse", **{"queries": {"tool_calls": TOOL_SQL, "model_calls": MODEL_SQL,
-                                                                      "tasks": RICH_TASK_SQL}, **extra})
+        super().write_config(destination="langfuse", langfuseReadSpacingSeconds=0, langfuseVisibilitySeconds=1,
+                             **{"queries": {"tool_calls": TOOL_SQL, "model_calls": MODEL_SQL, "tasks": RICH_TASK_SQL},
+                                **extra})
 
     def test_check_reads_the_project_with_basic_auth(self):
         result = self.cli("check")
@@ -882,6 +885,32 @@ class LangfuseExport(Base):
         self.wake()
         self.assertEqual(self.lf.duplicates(), [])
         self.assertEqual(len(self.lf.of_type("tool")), 2)
+
+    def test_secret_key_alone_is_sent_as_a_bearer_token(self):
+        self.lf_secret_only = True
+        self.assertEqual(self.cli("check")["projectName"], "LF Test")
+
+    def test_backfill_beyond_the_read_window_needs_a_flag(self):
+        self.add_tool("t1", 0, self.now - timedelta(hours=3))
+        self.wake()
+        refused = self.cli("backfill", "--days", "45", expect=2)
+        self.assertEqual((refused["code"], refused["readWindowDays"]), ("BEYOND_READ_WINDOW", 30))
+        self.assertTrue(self.cli("backfill", "--days", "45", "--beyond-read-window")["due"])
+        self.assertTrue(self.cli("backfill", "--days", "20", expect=3)["code"] == "BUSY")
+
+    def test_existence_check_is_one_query_per_window_not_per_trace(self):
+        t0 = self.now - timedelta(hours=6)
+        for i in range(12):
+            self.add_task(f"t{i}", t0 + timedelta(minutes=i), f"job {i}")
+            self.add_tool(f"t{i}", i, t0 + timedelta(minutes=i, seconds=30))
+        self.wake()
+        import shutil
+        shutil.rmtree(self.tmp / "state")  # lost state: the next run must check
+        self.lf.gets.clear()
+        self.wake()
+        reads = [g for g in self.lf.gets if g["route"] == "/api/public/v2/observations"]
+        self.assertEqual(self.lf.duplicates(), [])
+        self.assertLessEqual(len(reads), 4, f"12 traces checked in {len(reads)} reads")
 
     def test_resend_and_braintrust_reads_are_refused(self):
         self.add_tool("t1", 0, self.now - timedelta(hours=3))

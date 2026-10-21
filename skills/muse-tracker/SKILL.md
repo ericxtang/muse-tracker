@@ -77,17 +77,29 @@ works.
    A key pasted into chat is never used or stored; ask for a new one. When the
    person says the key was replaced, show the card again with `reconnect: true`.
 
-   **Connection (Langfuse).** Langfuse authenticates with HTTP Basic auth: the
-   project's public key as the username and its secret key as the password.
-   Find the host: `https://cloud.langfuse.com` (EU), `https://us.cloud.langfuse.com`,
-   `https://jp.cloud.langfuse.com`, `https://hipaa.cloud.langfuse.com`, or the
-   person's own server. Request a card with connector `custom.langfuse`,
-   provider `langfuse`, `api_hosts` set to that one host name, and Basic auth.
-   If `credentials.request_api_access` offers no Basic scheme, stop and tell
-   the person Langfuse cannot be connected from this Muse yet; never store the
-   keys anywhere else. Tell them in one line: **Create a key pair at Langfuse →
-   Project settings → API keys, tap Connect and enter both there. Never paste
-   them into this chat.**
+   **Connection (Langfuse).** Find the host: `https://cloud.langfuse.com` (EU),
+   `https://us.cloud.langfuse.com`, `https://jp.cloud.langfuse.com`,
+   `https://hipaa.cloud.langfuse.com`, or the person's own server. Langfuse
+   accepts the project's **secret key** as a bearer token, so the card has the
+   same shape as Braintrust's. Call `credentials.request_api_access` with:
+
+   ```json
+   {
+     "provider": "langfuse",
+     "api_hosts": ["HOST NAME, e.g. cloud.langfuse.com"],
+     "auth_scheme": "api_key",
+     "placement": "bearer_header"
+   }
+   ```
+
+   Tell the person in one line: **Create a key pair at Langfuse → Project
+   settings → API keys, tap Connect and paste the secret key (sk-lf-…) there.
+   Never paste it into this chat.** Then run `check`. If it fails with
+   `UNAUTHORIZED` although the key is right (a Langfuse server that accepts
+   only Basic auth), request a card that sends a custom `Authorization` header
+   instead, and have the person enter `Basic ` followed by the base64 of
+   `PUBLIC_KEY:SECRET_KEY`, computed on their own computer
+   (`printf '%s' 'pk-lf-…:sk-lf-…' | base64`). Never store keys anywhere else.
 
 2. **Config.** Setup uses defaults and asks nothing it can find out itself.
    For the project: if an existing Braintrust connector, its notes (for

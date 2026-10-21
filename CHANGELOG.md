@@ -3,6 +3,24 @@
 Versions follow MAJOR.MINOR.PATCH. `releases.json` records the source digest of
 each version; the build refuses sources that do not match their version.
 
+## 0.0.9 — 2026-10-21
+
+- **Langfuse auth works with a standard Muse card.** Verified against a real
+  Langfuse v4.67.0: a bearer *secret* key has full project access (a bearer
+  public key reaches only scores). Setup now requests the same `api_key` /
+  `bearer_header` card as Braintrust, holding the secret key, with a
+  `Basic`-header card as the fallback.
+- **Langfuse plan limits.** Existence checks are one query per page window
+  (by the agent's tag) instead of one per trace; reads are spaced to stay under
+  Hobby's 30 a minute; batches are sized on the OTLP body (≤ 4 MB); a backfill
+  older than the plan's read window (`langfuseReadWindowDays`, 30) needs
+  `--beyond-read-window`.
+- A send that failed without an answer is checked only once it is
+  `langfuseVisibilitySeconds` old: real Langfuse makes spans readable a few
+  seconds after accepting them.
+- `tests/e2e.py --langfuse-live URL` runs the Langfuse phases against a real
+  server through a stand-in for Muse's Secure Vault.
+
 ## 0.0.8 — 2026-10-21
 
 - **Langfuse destination** (`"destination": "langfuse"`). Spans go to

@@ -19,8 +19,8 @@ earlier download or a remembered hash does not establish the latest version.
    install) or fails with anything except `NETWORK_ERROR`, do step 2 over the
    existing folder; do not delete it.
 
-2. **First install.** Fetch {{BASE_URL}}/skills/muse-tracker/manifest.json
-   without a cached copy. Download the archive at its `archiveUrl` (the
+2. **First install.** Fetch {{MANIFEST_URL}}
+   without a cached copy (it redirects to the newest release). Download the archive at its `archiveUrl` (the
    address contains the release hash) and check that its SHA-256 equals the
    manifest's `sha256`. Inspect its files, then extract them into
    `~/workspace/skills/muse-tracker` and run

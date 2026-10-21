@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import fcntl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -56,7 +57,16 @@ class Braintrust:
                 outer.gets.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}})
                 if self.path == f"/v1/project/{PROJECT}":
                     return self.reply(200, {"id": PROJECT, "name": "Test"})
-                path = outer.static / self.path.split("?", 1)[0].lstrip("/") if outer.static else None
+                route = self.path.split("?", 1)[0]
+                if outer.static and route.startswith("/latest/download/"):
+                    # GitHub: latest/download/<asset> redirects to the newest release's asset.
+                    latest = (outer.static / "latest.txt").read_text().strip()
+                    self.send_response(302)
+                    self.send_header("Location", f"/download/v{latest}/{route.rsplit('/', 1)[1]}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                path = outer.static / route.lstrip("/") if outer.static else None
                 if path and path.is_file():
                     return self.reply(200, path.read_bytes())
                 self.reply(404, {"error": "not found"})
@@ -666,7 +676,9 @@ class Hook(Base):
 class Release(Base):
     def install(self, release):
         """Extract a built release the way setup.md does; returns the skill's CLI path."""
-        archive = (release / "skills" / "muse-tracker.zip").read_bytes()
+        version = (release / "latest.txt").read_text().strip()
+        [path] = (release / "download" / f"v{version}").glob("muse-tracker-*.zip")
+        archive = path.read_bytes()
         target = self.tmp / "install"
         with zipfile.ZipFile(io.BytesIO(archive)) as z:
             self.assertEqual(sorted(z.namelist()), sorted("muse-tracker/" + f for f in build.FILES))
@@ -688,10 +700,14 @@ class Release(Base):
         b = build.build(self.bt.url, self.tmp / "dist2")
         self.assertEqual(a["sha256"], b["sha256"])
         self.assertEqual(a["version"], (ROOT / "VERSION").read_text().strip())
-        self.assertTrue(a["archiveUrl"].endswith(f"/skills/muse-tracker-{a['version']}-{a['sha256']}.zip"))
-        versioned = (self.tmp / "dist" / "skills" / f"muse-tracker-{a['version']}-{a['sha256']}.zip").read_bytes()
+        folder = self.tmp / "dist" / "download" / f"v{a['version']}"
+        self.assertTrue(a["archiveUrl"].endswith(f"/download/v{a['version']}/muse-tracker-{a['version']}-{a['sha256']}.zip"))
+        self.assertEqual(a["manifestUrl"], self.bt.url + "/latest/download/manifest.json")
+        versioned = (folder / f"muse-tracker-{a['version']}-{a['sha256']}.zip").read_bytes()
         self.assertEqual(hashlib.sha256(versioned).hexdigest(), a["sha256"])
-        self.assertIn(self.bt.url, (self.tmp / "dist/skills/muse-tracker/setup.md").read_text())
+        self.assertIn(a["manifestUrl"], (folder / "setup.md").read_text())
+        self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                         sorted(["SKILL.md", "manifest.json", "setup.md", f"muse-tracker-{a['version']}-{a['sha256']}.zip"]))
 
     def test_released_version_matches_the_sources(self):
         """Fails when sources change without a VERSION bump and `build.py --release`."""
@@ -715,9 +731,11 @@ class Release(Base):
         cli = self.install(self.bt.static)
         self.assertNotIn("{{", cli.read_text())
         self.assertEqual(self.cli("setup-check", script=cli)["sha256"], release["sha256"])
-        manifest_gets = [g for g in self.bt.gets if "manifest.json" in g["path"]]
-        self.assertTrue(manifest_gets and all("fresh=" in g["path"] and g["headers"].get("cache-control") == "no-cache"
-                                              for g in manifest_gets), "every manifest read bypasses caches")
+        latest = [g for g in self.bt.gets if g["path"].startswith("/latest/download/manifest.json")]
+        self.assertTrue(latest and all("fresh=" in g["path"] and g["headers"].get("cache-control") == "no-cache"
+                                       for g in latest), "every lookup of the latest release bypasses caches")
+        followed = [g for g in self.bt.gets if g["path"].startswith(f"/download/v{release['version']}/manifest.json")]
+        self.assertEqual(len(followed), len(latest), "each lookup follows the redirect to the versioned asset")
         with (cli.parents[1] / "SKILL.md").open("a") as f:
             f.write("\nlocal edit\n")
         stale = self.cli("setup-check", script=cli, expect=2)
@@ -788,7 +806,7 @@ class Release(Base):
         before = {p: p.read_bytes() for p in cli.parents[1].rglob("*") if p.is_file()}
         self.bt.static = self.tmp / "served"
         v2 = build.build(self.bt.url, self.bt.static, source=self.newer_source("release two"), version="9.2.0")
-        archive = self.bt.static / "skills" / f"muse-tracker-9.2.0-{v2['sha256']}.zip"
+        archive = self.bt.static / "download" / "v9.2.0" / f"muse-tracker-9.2.0-{v2['sha256']}.zip"
         data = bytearray(archive.read_bytes())
         data[len(data) // 2] ^= 0xFF  # corrupt one byte in transit
         archive.write_bytes(bytes(data))
@@ -798,33 +816,20 @@ class Release(Base):
         after = {p: p.read_bytes() for p in cli.parents[1].rglob("*") if p.is_file()}
         self.assertEqual(after, before, "a failed update changes nothing")
 
-    def test_server_caches_only_the_content_addressed_archive(self):
-        import socket
-        import time
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = sock.getsockname()[1]
-        url = f"http://127.0.0.1:{port}"
-        server = subprocess.Popen([sys.executable, str(ROOT / "serve.py")], cwd=ROOT, stdout=subprocess.PIPE,
-                                  stderr=subprocess.DEVNULL, env={**os.environ, "PUBLIC_BASE_URL": url, "PORT": str(port)})
-        try:
-            server.stdout.readline()
-            import urllib.request
-            for _ in range(50):
-                try:
-                    manifest = json.loads(urllib.request.urlopen(url + "/skills/muse-tracker/manifest.json").read())
-                    break
-                except OSError:
-                    time.sleep(0.1)
-            def cache(path):
-                with urllib.request.urlopen(url + path) as response:
-                    return response.headers["Cache-Control"]
-            self.assertEqual(cache("/skills/muse-tracker/manifest.json"), "no-store")
-            self.assertEqual(cache("/skills/muse-tracker.zip"), "no-store")
-            self.assertIn("immutable", cache(manifest["archiveUrl"][len(url):]))
-        finally:
-            server.terminate()
-            server.wait()
+    def test_redirects_outside_the_release_hosts_are_refused(self):
+        build.build(self.bt.url, self.tmp / "v1")
+        cli = self.install(self.tmp / "v1")
+        self.bt.static = self.tmp / "served"
+        build.build(self.bt.url, self.bt.static)
+        self.assertTrue(self.cli("setup-check", script=cli)["ok"], "same-host redirects are followed")
+        (self.bt.static / "latest.txt").write_text("x")  # point latest at a missing asset
+        self.assertEqual(self.cli("setup-check", script=cli, expect=5)["code"], "NETWORK_ERROR")
+        spec = importlib.util.spec_from_file_location("installed", cli)
+        installed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installed)
+        self.assertTrue(installed.release_host(self.bt.url + "/download/v1/manifest.json"))
+        self.assertFalse(installed.release_host("http://127.0.0.2/manifest.json"))
+        self.assertFalse(installed.release_host("https://evil.example/manifest.json"))
 
 
 if __name__ == "__main__":

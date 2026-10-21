@@ -3,7 +3,17 @@
 Versions follow MAJOR.MINOR.PATCH. `releases.json` records the source digest of
 each version; the build refuses sources that do not match their version.
 
-## 0.0.6 — 2026-10-21
+## 0.0.7 — 2026-10-21
+
+- Releases are GitHub releases of the public `ericxtang/muse-tracker` repo;
+  the Railway server is gone. Installs read
+  `releases/latest/download/manifest.json` and follow GitHub's redirects, but
+  only over HTTPS to github.com and GitHub's download hosts; the archive's
+  SHA-256 is still checked against the manifest.
+- `build.py --publish` creates the release for `VERSION` and refuses one that
+  already exists.
+
+## 0.0.6 — 2026-10-21 (never published; superseded by 0.0.7)
 
 - The skill is now **`muse-tracker`** (was `braintrust-telemetry`): new install
   folder, config folder, hook id, CLI name (`scripts/muse_tracker.py`) and
@@ -16,7 +26,7 @@ each version; the build refuses sources that do not match their version.
 - Setup version 3: saved queries leave out the new hook's own runs
   (`event-hook:muse-tracker`).
 
-## 0.0.5 — 2026-10-21
+## 0.0.5 — 2026-10-21 (never published)
 
 - `setupRequired` no longer goes away after one `self-update`. The config
   records its `setupVersion` (missing means 1), and the wake payload,

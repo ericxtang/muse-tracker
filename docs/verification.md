@@ -18,8 +18,7 @@ I can read it. Messages in quotes go to Muse.
 ## 0. Prepare
 
 1. In Braintrust, create a project called **telemetry-probe**. Copy its ID
-   (project settings) and the ID of the project that will receive telemetry
-   (today: "My Project", `22e9848a-b189-4236-a72d-b4474a771d6b`).
+   (project settings) and the ID of the project that will receive telemetry.
 2. Create an API key that can read, write and delete logs in both projects.
    Muse uses the same key, so you can reuse the one in its vault or make a new
    one.
@@ -28,8 +27,8 @@ I can read it. Messages in quotes go to Muse.
    ```sh
    security add-generic-password -s braintrust-api -a "$USER" -w
    ```
-4. `local/config.json` already points at My Project. If telemetry goes
-   elsewhere, edit `projectId` there.
+4. Create `local/config.json` (ignored by git) with
+   `{"provider": "env", "projectId": "<receiving project ID>"}`.
 
 ## 1. Probe Braintrust
 
@@ -50,7 +49,7 @@ I can read it. Messages in quotes go to Muse.
 ## 2. Onboard Muse
 
 1. In a Muse chat:
-   > Follow https://skill-production-44c7.up.railway.app/skills/muse-tracker/setup.md to set up the Muse tracker.
+   > Follow https://github.com/ericxtang/muse-tracker/releases/latest/download/setup.md to set up the Muse tracker.
 2. It should ask nothing when a working `custom.braintrust` card and a known
    project already exist. Otherwise it asks only to connect the card or for the
    project ID. **Pass:** no question about history (the past 7 days is the

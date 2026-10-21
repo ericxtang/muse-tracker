@@ -77,6 +77,26 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class ReleaseRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow the release host's redirects (GitHub sends latest/download to the
+    newest release, then to a signed download address), but only over HTTPS to
+    that host or GitHub's download hosts. The archive's hash is checked anyway."""
+    max_redirections = 5
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not release_host(newurl):
+            raise Failure("INVALID_RESPONSE", "The release redirected outside its hosts.", 5)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def release_host(url):
+    parts, base = urllib.parse.urlsplit(url), urllib.parse.urlsplit(BASE_URL)
+    if base.scheme == "http" and base.hostname == "127.0.0.1":  # tests
+        return parts.scheme == "http" and parts.netloc == base.netloc
+    return parts.scheme == "https" and (parts.hostname == base.hostname
+                                        or (parts.hostname or "").endswith(".githubusercontent.com"))
+
+
 # ---------- files and state ----------
 
 def read_json(path, default=None):
@@ -547,7 +567,7 @@ def fetch(url, timeout):
     fresh = url + ("&" if "?" in url else "?") + "fresh=" + uuid.uuid4().hex
     request = urllib.request.Request(fresh, headers={"Cache-Control": "no-cache", "Pragma": "no-cache"})
     try:
-        with urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout) as response:
+        with urllib.request.build_opener(ReleaseRedirect()).open(request, timeout=timeout) as response:
             return response.read(MAX_ARCHIVE_BYTES + 1)
     except (urllib.error.URLError, TimeoutError, OSError):
         raise Failure("NETWORK_ERROR", "Could not reach the skill release.", 5)
@@ -555,7 +575,7 @@ def fetch(url, timeout):
 
 def fetch_manifest(timeout=15):
     try:
-        manifest = json.loads(fetch(BASE_URL.rstrip("/") + f"/skills/{SKILL}/manifest.json", timeout))
+        manifest = json.loads(fetch(BASE_URL.rstrip("/") + "/latest/download/manifest.json", timeout))
     except ValueError:
         raise Failure("INVALID_RESPONSE", "The published skill manifest is not JSON.", 5)
     if (not isinstance(manifest, dict) or manifest.get("baseUrl") != BASE_URL

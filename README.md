@@ -10,6 +10,25 @@ model, scheduling, paging and duplicate handling do not depend on it. See
 [Destinations](#destinations) for what is shared, what is Braintrust-specific
 today, and what a new tool must offer.
 
+## Install
+
+Tell Muse:
+
+> Follow https://github.com/ericxtang/muse-tracker/releases/latest/download/setup.md to set up the Muse tracker.
+
+Muse downloads the release, checks its hash against the manifest, installs it,
+writes the queries, runs a dry run and the first export, and installs the hook.
+It reuses an existing `custom.braintrust` vault card and the project an
+existing Braintrust connector names, so setup asks no questions when those
+exist.
+
+**Moving from `braintrust-telemetry`.** This skill had that name before 0.0.6.
+The setup guide detects an old install and runs `migrate`, which copies its
+config and export state (watermark, run in progress, sent rows) to the new
+names, so the export continues where it stopped. Row ids do not depend on the
+skill's name, so nothing already sent is duplicated. Until it moves, an old
+install keeps exporting with the files it has; it no longer receives updates.
+
 ## Why muse.db
 
 Muse exposes no live instrumentation hooks, and tracing tools' setup flows
@@ -17,48 +36,6 @@ cannot attach to a running Muse agent. But Muse's records database, `muse.db`,
 holds complete execution records. The skill reads those after the fact, so it
 needs no change to Muse and sees everything Muse recorded, including history
 from before it was installed.
-
-## How it works
-
-```
-native hook (every 5 min)          worker (when an export is due)
-assets/export-hook.sh ──wake──▶  plan ─▶ muse.db queries ─▶ export ─▶ destination
-  local timer only; no              next page    saved at       its API,
-  credentials, no worker            of the run   setup          vault key
-  unless an export is due           └──────── repeat until more: false ────────┘
-```
-
-1. **The hook** checks a local timer and wakes a Muse worker only when an
-   export is due (hourly by default). It never loads credentials, backs off
-   after repeated failures, and reports a failure once (again after 24 hours if
-   it persists).
-2. **The queries** are written once, at setup, by Muse itself against the real
-   `muse.db` schema. They return rows in a fixed shape (the
-   [row contract](skills/muse-tracker/references/records.md#row-contract)):
-   tasks, tool calls and model calls. The worker runs them through Muse's
-   `muse.db` tool, one page at a time.
-3. **The CLI** groups the rows into one trace per agent task (a root `task`
-   span, `llm` spans with token counts, `tool` spans), redacts common secret
-   shapes, and sends the trace to the destination.
-
-**Every wake sends everything since the last export.** A run covers the last
-export's end, minus a 30-minute overlap for rows written late, up to now. The
-first run covers the past 7 days; `backfill --days N` sends older history on
-request. A run cut short resumes at the next wake.
-
-**Re-sending never duplicates.** Every row's id is derived from the record
-(SHA-256 of the agent, task and call identity), not from when or how it was
-sent, and the destination replaces a row sent again with the same id. A retry,
-the overlap, a lost state folder or a full re-export all leave one row per
-record. A local hash of recently sent rows also skips unchanged ones.
-
-**Agents with no user message** (subagents, hook workers, pipeline stages)
-take their root input from the preamble they were started with, such as
-`[Subagent Context] …`, so their traces show what they were asked to do.
-
-See [`SKILL.md`](skills/muse-tracker/SKILL.md) for the procedure Muse follows,
-and [`references/records.md`](skills/muse-tracker/references/records.md) for the
-row contract, query rules, attribute mapping and config.
 
 ## Destinations
 
@@ -95,25 +72,6 @@ second tool is added:
    `muse.db` holds with what the tool stored. Optional, but without it a
    destination cannot be verified.
 
-## Install
-
-Tell Muse:
-
-> Follow https://skill-production-44c7.up.railway.app/skills/muse-tracker/setup.md to set up the Muse tracker.
-
-Muse downloads the release, checks its hash against the manifest, installs it,
-writes the queries, runs a dry run and the first export, and installs the hook.
-It reuses an existing `custom.braintrust` vault card and the project an
-existing Braintrust connector names, so setup asks no questions when those
-exist.
-
-**Moving from `braintrust-telemetry`.** This skill had that name before 0.0.6.
-The setup guide detects an old install and runs `migrate`, which copies its
-config and export state (watermark, run in progress, sent rows) to the new
-names, so the export continues where it stopped. Row ids do not depend on the
-skill's name, so nothing already sent is duplicated. Until it moves, an old
-install keeps exporting with the files it has; it no longer receives updates.
-
 ## Layout
 
 | Path | What it is |
@@ -121,23 +79,23 @@ install keeps exporting with the files it has; it no longer receives updates.
 | `skills/muse-tracker/` | The skill: `SKILL.md`, `assets/export-hook.sh`, `scripts/muse_tracker.py`, `references/records.md` |
 | `docs/agent-setup.md` | The install, update and migration guide, served as `setup.md` |
 | `docs/verification.md` | Step-by-step check of a live install |
-| `build.py` | Stamps the version and base URL into the skill and writes a release to `dist/` |
-| `serve.py`, `Dockerfile` | The Railway service that hosts releases |
+| `build.py` | Stamps the version and release address into the skill, builds a release and publishes it to GitHub |
 | `tests/` | End-to-end tests against a mock Braintrust API and a SQLite stand-in for `muse.db` |
 | `sample/` | `muse.db` schema (from the real catalog) and a synthetic sample database |
 | `bin/bt-local` | Runs the CLI on this Mac with the Braintrust key from the macOS keychain |
 
 ## Hosting
 
-The Railway project `muse-tracker` (service `skill`) hosts releases and nothing
-else; it is linked to this repo's `main` branch, so a push deploys. The service
-builds the release for its own URL at startup and serves the manifest, the ZIP,
-`SKILL.md`, `setup.md` and `/health`.
+Releases are [GitHub releases](https://github.com/ericxtang/muse-tracker/releases)
+of this public repo; there is no server. Each release carries four assets: the
+skill archive (`muse-tracker-<version>-<sha256>.zip`), `manifest.json`,
+`setup.md` and `SKILL.md`. Installs read the manifest at
+`releases/latest/download/manifest.json`, which GitHub redirects to the newest
+release.
 
-**Records never pass through it.** Muse reads `muse.db` and sends rows straight
-to the destination's API with the vault-held key. The host sees only manifest
-checks (when an export is due) and downloads (on install and update), never
-record contents or keys.
+**Records never pass through GitHub.** Muse reads `muse.db` and sends rows
+straight to the destination's API with the vault-held key. GitHub sees only
+manifest checks (when an export is due) and downloads (on install and update).
 
 ## Releases and updates
 
@@ -174,8 +132,11 @@ To release:
 echo 0.0.7 > VERSION                # bump
 python3 build.py --release          # record the new sources
 python3 -m unittest discover -s tests
-git push origin main                # Railway deploys; installs update at their next export
+git push origin main
+python3 build.py --publish          # creates GitHub release vVERSION; installs update at their next export
 ```
+
+`--publish` refuses a version that already has a release.
 
 Add an entry to [`CHANGELOG.md`](CHANGELOG.md).
 

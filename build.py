@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Render the skill for a publish URL and write a static release to dist/.
+"""Build a release of the skill and publish it as a GitHub release.
 
-    python3 build.py --base-url https://example.com [--out dist]
     python3 build.py --release      # record the current sources as VERSION
+    python3 build.py --publish      # build and create GitHub release vVERSION
+    python3 build.py --base-url URL [--out dist]   # build only (tests, previews)
 
 VERSION holds the release version. releases.json maps each released version to
 a digest of its sources, and the build refuses to publish sources that differ
 from what their version recorded: change anything, bump VERSION, run --release.
 
-Layout matches the Let's Swap skill routes, plus a content-addressed archive
-that the manifest points at, so a cached archive can never pass for a newer one:
-    skills/muse-tracker.zip              (latest, for people)
-    skills/muse-tracker-<version>-<sha256>.zip  (immutable; manifest.archiveUrl)
-    skills/muse-tracker/{manifest.json,SKILL.md,setup.md}
+A release's assets, as GitHub serves them under BASE_URL
+(https://github.com/OWNER/REPO/releases):
+    download/vVERSION/manifest.json, setup.md, SKILL.md
+    download/vVERSION/muse-tracker-VERSION-SHA256.zip   (manifest.archiveUrl)
+    latest/download/<asset>   GitHub's redirect to the newest release's asset
+Installs read latest/download/manifest.json; the archive address contains
+its version and hash, so a cached archive can never pass for a newer one.
 """
 import argparse
 from datetime import date
@@ -22,10 +25,14 @@ import json
 from pathlib import Path
 import re
 import shutil
+import subprocess
+import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parent
 SKILL = "muse-tracker"
+REPO = "ericxtang/muse-tracker"
+DEFAULT_BASE_URL = f"https://github.com/{REPO}/releases"
 FILES = ("SKILL.md", "assets/export-hook.sh", "references/records.md", "scripts/muse_tracker.py")
 EXECUTABLE = {"assets/export-hook.sh", "scripts/muse_tracker.py"}
 # Bump when an update requires installed agents to repeat setup.
@@ -38,8 +45,17 @@ RELEASES = ROOT / "releases.json"
 
 
 def render(text, base_url, version):
-    return (text.replace("{{BASE_URL}}", base_url).replace("{{VERSION}}", version)
+    return (text.replace("{{MANIFEST_URL}}", manifest_url(base_url)).replace("{{SETUP_URL}}", setup_url(base_url))
+            .replace("{{BASE_URL}}", base_url).replace("{{VERSION}}", version)
             .replace("{{SETUP_VERSION}}", str(SETUP_VERSION)))
+
+
+def manifest_url(base_url):
+    return f"{base_url.rstrip('/')}/latest/download/manifest.json"
+
+
+def setup_url(base_url):
+    return f"{base_url.rstrip('/')}/latest/download/setup.md"
 
 
 def current_version():
@@ -112,18 +128,47 @@ def build(base_url, out, source=None, version=None):
         "sha256": sha256,
         "files": {name: hashlib.sha256(rendered[name]).hexdigest() for name in FILES},
         "baseUrl": base_url,
-        "archiveUrl": f"{base_url}/skills/{SKILL}-{version}-{sha256}.zip",
-        "setupUrl": f"{base_url}/skills/{SKILL}/setup.md",
+        "manifestUrl": manifest_url(base_url),
+        "archiveUrl": f"{base_url}/download/v{version}/{archive_name(version, sha256)}",
+        "setupUrl": setup_url(base_url),
     }
     out = Path(out)
-    shutil.rmtree(out, ignore_errors=True)
-    folder = out / "skills" / SKILL
+    folder = out / "download" / f"v{version}"
+    shutil.rmtree(folder, ignore_errors=True)
     folder.mkdir(parents=True)
-    (out / "skills" / f"{SKILL}.zip").write_bytes(data)
-    (out / "skills" / f"{SKILL}-{version}-{sha256}.zip").write_bytes(data)
+    (folder / archive_name(version, sha256)).write_bytes(data)
     (folder / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     (folder / "SKILL.md").write_bytes(rendered["SKILL.md"])
     (folder / "setup.md").write_text(render(SETUP_GUIDE.read_text(), base_url, version))
+    (out / "latest.txt").write_text(version + "\n")  # what latest/download resolves to in a local preview
+    return manifest
+
+
+def archive_name(version, sha256):
+    return f"{SKILL}-{version}-{sha256}.zip"
+
+
+def release_notes(version):
+    """The CHANGELOG section for a version."""
+    text = (ROOT / "CHANGELOG.md").read_text()
+    match = re.search(rf"^## {re.escape(version)}\b.*?$(.*?)(?=^## |\Z)", text, re.M | re.S)
+    return match.group(1).strip() if match else f"muse-tracker {version}"
+
+
+def publish():
+    """Create GitHub release vVERSION with the built assets and mark it latest.
+    A published version is never replaced: bump VERSION instead."""
+    version = current_version()
+    tag = f"v{version}"
+    if subprocess.run(["gh", "release", "view", tag, "--repo", REPO], capture_output=True).returncode == 0:
+        raise SystemExit(f"Release {tag} already exists. Bump VERSION, then run: python3 build.py --release")
+    out = Path(tempfile.mkdtemp())
+    manifest = build(DEFAULT_BASE_URL, out)
+    folder = out / "download" / tag
+    notes = out / "notes.md"
+    notes.write_text(release_notes(version) + "\n")
+    subprocess.run(["gh", "release", "create", tag, *sorted(str(p) for p in folder.iterdir()), "--repo", REPO,
+                    "--title", f"muse-tracker {version}", "--notes-file", str(notes), "--latest"], check=True)
     return manifest
 
 
@@ -132,13 +177,16 @@ def main():
     parser.add_argument("--base-url")
     parser.add_argument("--out", default=str(ROOT / "dist"))
     parser.add_argument("--release", action="store_true", help="Record the current sources as VERSION in releases.json")
+    parser.add_argument("--publish", action="store_true", help="Build and create the GitHub release for VERSION")
     args = parser.parse_args()
     if args.release:
         print(json.dumps(record_release(), indent=2))
+    elif args.publish:
+        print(json.dumps(publish(), indent=2))
     elif args.base_url:
         print(json.dumps(build(args.base_url, args.out), indent=2))
     else:
-        parser.error("pass --base-url or --release")
+        parser.error("pass --release, --publish or --base-url")
 
 
 if __name__ == "__main__":

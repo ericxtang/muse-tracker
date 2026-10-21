@@ -10,7 +10,7 @@ with the same `task_id` become one trace. Unknown extra columns are ignored.
 | --- | --- | --- |
 | `tool_calls` | `task_id`, `tool`, `started_at` | `id` or `seq` (stable per call), `ended_at`, `args`, `result`, `success`, `server` |
 | `model_calls` | `task_id`, `at` | `message_id` or `id`, `ended_at`, `input_tokens`, `output_tokens`, `model`, `output_text`, `input_text`, `note` |
-| `tasks` | `task_id`, `start` | `end`, `request_text`, `context_text`, `output_text`, `agent_id`, `surface`, `session_id`, `parent_task_id`, `status`, `kind`, `model`, `depth` |
+| `tasks` | `task_id`, `start`, `end` | `request_text`, `context_text`, `output_text`, `agent_id`, `surface`, `session_id`, `parent_task_id`, `status`, `kind`, `model`, `depth` |
 
 Where the optional columns come from in `muse.db` (see `sample/schema.sql`):
 
@@ -41,8 +41,11 @@ Where the optional columns come from in `muse.db` (see `sample/schema.sql`):
     shows `request_text` when there is one, otherwise `context_text`, and
     `metadata.request_source` says which (`user` or `context`). Without it,
     subagent, hook-worker and pipeline roots have no input.
-  - `end` is the agent's last activity. It keeps a root's bounds right when the
-    root is re-sent on its own (`backfill --resend --only tasks`).
+  - `end` is the agent's last activity, and the query pages on it
+    (`tasksTimeColumn: "end"`): an agent's row comes back in every window where
+    it does something, so its root keeps the latest status and answer, and an
+    agent that started before the first window still gets its input. `start`
+    (its first activity) sets the root's start time.
 
 ## Query rules
 
@@ -51,7 +54,7 @@ Where the optional columns come from in `muse.db` (see `sample/schema.sql`):
   (or the `_ms` pair). Compare like with like: if the column stores
   `2026-10-20 12:00:00`, compare `julianday(col)` with `julianday(:since_iso)`.
 - Filter and order on the contract's time column for that query
-  (`tool_calls.started_at`, `model_calls.at`, `tasks.start`). The CLI pages on
+  (`tool_calls.started_at`, `model_calls.at`, `tasks.end`). The CLI pages on
   it and rejects rows outside the window (`QUERY_MISMATCH`).
 - `tool_calls` and `model_calls` must end with `LIMIT :limit`; give `tasks`
   one too (it must have one to be re-sent on its own). A full result
@@ -175,8 +178,10 @@ config sets `userId` / `environment`.
 **Each span is sent once.** Langfuse stores every write: a span sent again
 with the same id is stored again ([docs](https://langfuse.com/faq/all/tracing-data-updates)).
 
-- Children are sent the first time they are seen; the sent registry is checked
-  by id, so the overlap re-reads nothing twice.
+- Children are sent once; the sent registry is checked by id, so the overlap
+  re-reads nothing twice. A child waits until its task's row has been seen
+  (the row comes with the task's last activity), so it carries the task's
+  session and tags; the end of a run releases any still waiting.
 - A task's root is held in the ledger until a run reaches the present and the
   task has been idle for `rootSettleMinutes`, then sent once with its final
   bounds. Activity after that (a task resumed hours later) still arrives as
@@ -212,6 +217,7 @@ On Core (90 days) or Pro (3 years), raise `langfuseReadWindowDays` and lower
 | --- | --- | --- |
 | `destination` | `braintrust` | The observability tool to send to: `braintrust` or `langfuse` |
 | `langfuseHost` | `https://cloud.langfuse.com` | Langfuse origin (`us.`, `jp.`, `hipaa.` cloud regions, or self-hosted) |
+| `tasksTimeColumn` | `start` | The tasks query's paging column: `end` (last activity; Setup writes this) or `start` (configs before setup version 5) |
 | `rootSettleMinutes` | 120 | Langfuse: how long a task must be idle before its root is sent |
 | `langfuseReadWindowDays` | 30 | Langfuse: how far back the plan lets reads (and the UI) see |
 | `langfuseReadSpacingSeconds` | 2.1 | Langfuse: minimum time between reads (Hobby allows 30 a minute) |

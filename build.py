@@ -36,7 +36,7 @@ DEFAULT_BASE_URL = f"https://github.com/{REPO}/releases"
 FILES = ("SKILL.md", "assets/export-hook.sh", "references/records.md", "scripts/muse_tracker.py")
 EXECUTABLE = {"assets/export-hook.sh", "scripts/muse_tracker.py"}
 # Bump when an update requires installed agents to repeat setup.
-SETUP_VERSION = 4
+SETUP_VERSION = 5
 
 
 SEMVER = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")

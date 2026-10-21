@@ -433,7 +433,7 @@ def build_traces(rows, ledger, config):
                            input_=request or None, output=answer or None)
         out.append((task_id, [root_event] + sorted(events, key=lambda e: (start_ms(e), e["span_id"])),
                     {"start": start, "end": end, "request": request, "requestSource": source,
-                     "output": answer or None, **kept}))
+                     "output": answer or None, "taskSeen": bool(task) or bool(seen.get("taskSeen")), **kept}))
     return sorted(out, key=lambda t: (start_ms(t[1][0]), t[0]))
 
 
@@ -1006,6 +1006,17 @@ def self_update(previous_receipt, config=None):
 TIME_COLUMN = {"tool_calls": "started_at", "model_calls": "at", "tasks": "start"}
 
 
+def time_columns(config):
+    """Each query's paging column. The tasks query pages on an agent's last
+    activity (`end`, setup version 5), so an agent's row comes back whenever it
+    does something new and its root keeps its latest status and answer; older
+    configs page on its first activity (`start`)."""
+    column = config.get("tasksTimeColumn") or "start"
+    if column not in ("start", "end"):
+        raise Failure("SETUP_ERROR", "tasksTimeColumn must be start or end.", 6)
+    return {**TIME_COLUMN, "tasks": column}
+
+
 def run_page(config, state, now):
     """The next page of the current run. A run covers everything from the last
     export (minus overlapMinutes, to catch rows written late) up to the moment
@@ -1118,12 +1129,12 @@ def limited(queries):
     return [name for name, sql in queries.items() if ":limit" in sql]
 
 
-def cut_page(rows, page, limit, bounded=REQUIRED_QUERIES):
+def cut_page(rows, page, limit, bounded=REQUIRED_QUERIES, columns=TIME_COLUMN):
     """Check every row lies in the page, then, if a limited query came back
     full, cut the page at its last timestamp so no row is lost or split."""
     times = {}
     for name, items in rows.items():
-        column = TIME_COLUMN[name]
+        column = columns[name]
         values = []
         for row in items:
             t = to_ms(row.get(column))
@@ -1163,7 +1174,7 @@ def export_page(directory, config, queries, dry_run, output):
             raise Failure("MISSING_ROWS", "Run every planned query and save its rows, even when empty ([]).", 2, missing=missing)
         page_bytes = sum((folder / f"{name}.json").stat().st_size for name in queries)
     try:
-        rows, cut, more = cut_page(rows, page, values["limit"], limited(queries))
+        rows, cut, more = cut_page(rows, page, values["limit"], limited(queries), time_columns(config))
     except Failure as failure:
         if direct or failure.payload["code"] != "PAGE_STUCK" or values["limit"] >= int(config["maxRows"]):
             raise
@@ -1184,15 +1195,28 @@ def export_page(directory, config, queries, dry_run, output):
         # tasks into the ledger first: a held root is rebuilt from it.
         for task_id, _, entry in traces:
             ledger[task_id] = {**ledger.get(task_id, {}), **entry, "seenAt": now}
-        fresh = [span for _, task_spans, _ in traces for span in task_spans[1:] if span_key(span) not in sent]
+        # A child carries its task's trace-level fields (session, tags), which
+        # come from the task's row. That row arrives with the task's last
+        # activity, so hold a child until its task's row has been seen; the
+        # end of the run releases the rest.
+        children, seen_keys = [], set()
+        for span in (state.get("heldSpans") or []) + [s for _, ts, _ in traces for s in ts[1:]]:
+            if span_key(span) not in sent and span_key(span) not in seen_keys:
+                seen_keys.add(span_key(span))
+                children.append(span)
+        held = [c for c in children if more and not ledger.get(c["metadata"]["task_id"], {}).get("taskSeen")]
+        held_keys = {span_key(c) for c in held}
+        fresh = [c for c in children if span_key(c) not in held_keys]
+        state["heldSpans"] = held
         if not more:
             # The run has read everything up to its end, so a task idle since
             # well before then is finished: send its root now, once.
             settle = int(config["rootSettleMinutes"]) * 60_000
             roots_ready = [t for t, e in ledger.items() if not e.get("rootSent") and e["end"] <= cut - settle]
         fresh += [root_from_ledger(config, t, ledger[t], int(config["maxAttributeChars"])) for t in roots_ready]
-        task_of = {hexid(f"{agent}:{t}", 32): t for t in [t for t, _, _ in traces] + roots_ready}
-        contexts = {trace: trace_context(config, t, ledger[t]) for trace, t in task_of.items()}
+        task_of = {hexid(f"{agent}:{t}", 32): t
+                   for t in [t for t, _, _ in traces] + roots_ready + [c["metadata"]["task_id"] for c in fresh]}
+        contexts = {trace: trace_context(config, t, ledger.get(t, {})) for trace, t in task_of.items()}
         if fresh and not dry_run:
             uncertain = set(state.get("uncertain") or [])
             if "langfuseCheck" not in run:
@@ -1303,7 +1327,8 @@ def export_page(directory, config, queries, dry_run, output):
               **({"backfill": True} if run.get("backfill") else {})}
     if langfuse(config):
         result.update(rootsSent=sum(1 for t in roots_ready if ledger.get(t, {}).get("rootSent")),
-                      rootsHeld=sum(1 for e in ledger.values() if not e.get("rootSent")))
+                      rootsHeld=sum(1 for e in ledger.values() if not e.get("rootSent")),
+                      childrenHeld=len(state.get("heldSpans") or []))
     if not direct:
         result.update(pageBytes=page_bytes, nextPageRows=page_limit(config, state))
     return result
@@ -1404,7 +1429,7 @@ def reconcile(config_path, config, since_text, until_text, limit=10_000):
     full = [name for name in limited(queries) if len(rows[name]) >= limit]
     if full:
         raise Failure("RANGE_TOO_LARGE", f"More than {limit} rows; reconcile a shorter range.", 2, queries=full)
-    cut_page(rows, window, limit + 1)  # every row must lie in the range
+    cut_page(rows, window, limit + 1, columns=time_columns(config))  # every row must lie in the range
     expected = [e for _, events, _ in build_traces(rows, {}, config) for e in events]
     traces = sorted({e["root_span_id"] for e in expected})
     actual = rows_for_traces(config, project, traces) if traces else []
@@ -1616,8 +1641,8 @@ def status(config_path, config):
             "lastExport": state.get("lastExport"), "failure": state.get("failure"),
             "updateFailure": state.get("updateFailure"),
             "sentRegistry": len(state.get("sent", {})), "destination": config.get("destination"),
-            **({"rootsHeld": sum(1 for e in state.get("ledger", {}).values() if not e.get("rootSent"))}
-               if langfuse(config) else {}),
+            **({"rootsHeld": sum(1 for e in state.get("ledger", {}).values() if not e.get("rootSent")),
+                "childrenHeld": len(state.get("heldSpans") or [])} if langfuse(config) else {}),
             "lagMinutes": round((now_ms() - watermark) / 60_000, 1) if watermark else None,
             "stats": state.get("stats", {}), "nextPageRows": page_limit(config, state),
             "nextDue": iso(timer["nextDue"]) if timer.get("nextDue") else None,

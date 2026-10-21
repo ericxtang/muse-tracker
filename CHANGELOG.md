@@ -3,6 +3,18 @@
 Versions follow MAJOR.MINOR.PATCH. `releases.json` records the source digest of
 each version; the build refuses sources that do not match their version.
 
+## 0.0.10 — 2026-10-21
+
+- **Task roots follow the agent's last activity.** The `tasks` query now pages
+  on `end` (`tasksTimeColumn: "end"`), so an agent's row comes back whenever
+  it does something new. Roots of agents that started before the first export
+  window now get their input, kind, session and status, and a root's status and
+  final answer stay current instead of freezing at the agent's start.
+- Langfuse: a child span waits until its task's row has been seen, so every span
+  carries the task's session and tags (`childrenHeld` in `export` and `status`).
+- Setup version 5: rewrite `queries.tasks` to page on `end`; Braintrust installs
+  then re-send task roots once to repair those already sent.
+
 ## 0.0.9 — 2026-10-21
 
 - **Langfuse auth works with a standard Muse card.** Verified against a real

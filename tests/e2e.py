@@ -59,8 +59,8 @@ SELECT * FROM (
     a.status AS status, COALESCE(a.agent_type, a.kind) AS kind, a.model AS model, a.depth AS depth
   FROM "agent.agents" a
 ) t
-WHERE julianday(t.start) >= julianday(:since_iso) AND julianday(t.start) < julianday(:until_iso)
-ORDER BY julianday(t.start), t.task_id LIMIT :limit"""
+WHERE julianday(t."end") >= julianday(:since_iso) AND julianday(t."end") < julianday(:until_iso)
+ORDER BY julianday(t."end"), t.task_id LIMIT :limit"""
 
 TOOLS_SQL = """
 SELECT c.agent_id AS task_id, c.seq AS seq, c.tool_name AS tool, rc.server_name AS server,
@@ -261,7 +261,7 @@ def main():
         for dest in ("braintrust", "langfuse"):
             config = run.tmp / dest / "config.json"
             config.parent.mkdir()
-            base = {"provider": "env", "agentId": run.agent, "destination": dest, "queries": queries, "maxRows": 5,
+            base = {"provider": "env", "agentId": run.agent, "tasksTimeColumn": "end", "destination": dest, "queries": queries, "maxRows": 5,
                     "setupVersion": build.SETUP_VERSION}
             if dest == "braintrust":
                 base["projectId"] = PROJECT

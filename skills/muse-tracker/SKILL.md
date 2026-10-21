@@ -117,6 +117,7 @@ works.
      "agentId": "YOUR MUSE NAME",
      "intervalMinutes": 60,
      "setupVersion": {{SETUP_VERSION}},
+     "tasksTimeColumn": "end",
      "queries": {}
    }
    ```
@@ -141,14 +142,16 @@ works.
    `SELECT` that returns the contract's column names, filters on its time column
    with `:since_iso`/`:until_iso` or `:since_ms`/`:until_ms` (half-open:
    `>= since AND < until`) **on the contract's time column** (`started_at`,
-   `at`, `start`), orders by that column and ends with `LIMIT :limit`. The CLI
+   `at`, and `end` for tasks), orders by that column and ends with `LIMIT :limit`. The CLI
    rejects rows outside the window, and pages on that column. Store
    them in `queries.tool_calls`, `queries.model_calls` and `queries.tasks`.
    The `tasks` query returns one row per agent, including agents with no user
    message (subagents, hook workers): `request_text` from the first user
    message and `context_text` from the preamble the agent started with (a
    subagent's begins `[Subagent Context]`), so every root shows what that
-   agent was asked to do. Give it `end` and `LIMIT :limit` too. Fill the
+   agent was asked to do. It filters and orders on `end`, the agent's last
+   activity (`MAX(created_at)` of its items), so the row comes back whenever
+   the agent does something new; `start` is its first. Fill the
    optional columns `muse.db` can supply (join `agent.agents` and
    `runtime.messages`): `session_id`, `parent_task_id`, `status`, `kind`,
    `model`, `depth` and `output_text` on tasks, `output_text` on model calls,
@@ -299,6 +302,17 @@ the person; stay silent unless one fails. Each change is safe to repeat.
   queries where `muse.db` has them, and check with a dry run. For Braintrust,
   roots already sent pick them up as their tasks are seen again; nothing else
   needs re-sending.
+- **Setup version 5 (0.0.10): tasks follow the agent's last activity.** A
+  `tasks` row used to come back only in the window where the agent *started*,
+  so an agent that began before the first window had a root with no input, and
+  a root kept the status and answer it had when the agent started. Rewrite
+  `queries.tasks` to filter and order on the agent's last activity (`end`, the
+  `MAX(created_at)` it already returns) instead of its first, keep `start` as a
+  column, and set `"tasksTimeColumn": "end"` in the config; check with a dry
+  run. For Braintrust, then repair roots already sent:
+  `backfill --resend --only tasks --since HISTORY_FROM` (as in setup version 2),
+  and On wake steps 3–4 until `more: false`. For Langfuse, roots not yet sent
+  pick up the fix; roots already sent cannot be changed.
 
 ## Verification
 

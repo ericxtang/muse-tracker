@@ -394,6 +394,57 @@ class Export(Base):
         [root] = self.bt.of_type("task")
         self.assertEqual((root["metadata"]["session_id"], root["output"]), ("sess-1", "final answer"))
 
+    LIVE_SQL = ('SELECT task_id, start, "end", request_text, status, output_text FROM agent.live '
+                'WHERE julianday("end") >= julianday(:since_iso) AND julianday("end") < julianday(:until_iso) '
+                'ORDER BY julianday("end") LIMIT :limit')
+
+    def live_task(self, task, start, end, request, status, answer=None):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('CREATE TABLE IF NOT EXISTS live (task_id, start, "end", request_text, status, output_text)')
+            conn.execute("DELETE FROM live WHERE task_id = ?", (task,))
+            conn.execute("INSERT INTO live VALUES (?,?,?,?,?,?)", (task, iso(start), iso(end), request, status, answer))
+
+    def test_tasks_paged_on_last_activity_fill_roots_that_started_before_the_window(self):
+        self.write_config(tasksTimeColumn="end",
+                          queries={"tool_calls": TOOL_SQL, "model_calls": MODEL_SQL, "tasks": self.LIVE_SQL})
+        began = self.now - timedelta(days=9)  # before the first run's 7-day window
+        last = self.now - timedelta(hours=3)
+        self.live_task("old", began, last, "long-running job", "completed", "all done")
+        self.add_tool("old", 0, last - timedelta(minutes=1))
+        self.wake()
+        [root] = self.bt.of_type("task")
+        self.assertEqual((root["input"], root["output"], root["metadata"]["status"]),
+                         ("long-running job", "all done", "completed"))
+        self.assertAlmostEqual(root["metrics"]["start"], began.timestamp(), delta=1, msg="bounds reach its real start")
+
+    def test_root_status_and_answer_follow_the_agent(self):
+        self.write_config(tasksTimeColumn="end",
+                          queries={"tool_calls": TOOL_SQL, "model_calls": MODEL_SQL, "tasks": self.LIVE_SQL})
+        t0 = self.now - timedelta(hours=2)
+        self.live_task("job", t0, t0 + timedelta(minutes=1), "do the thing", "running")
+        self.add_tool("job", 0, t0 + timedelta(minutes=1))
+        self.wake()
+        [root] = self.bt.of_type("task")
+        self.assertEqual((root["metadata"]["status"], root.get("output")), ("running", None))
+        # An hour later the agent finishes; its tasks row comes back with the new last activity.
+        done = self.now - timedelta(minutes=10)
+        self.live_task("job", t0, done, "do the thing", "completed", "thing done")
+        self.add_tool("job", 1, done - timedelta(seconds=30))
+        state = self.state()
+        state["watermark"] -= 3_600_000
+        self.set_state(state)
+        self.wake()
+        [root] = self.bt.of_type("task")
+        self.assertEqual((root["metadata"]["status"], root["output"]), ("completed", "thing done"))
+
+    def test_a_start_paged_tasks_query_still_works(self):
+        # Configs from before setup version 5 page tasks on their first activity.
+        t0 = self.now - timedelta(hours=2)
+        self.add_task("t1", t0, "summarize")
+        self.add_tool("t1", 0, t0 + timedelta(minutes=1))
+        self.wake()
+        self.assertEqual(self.bt.of_type("task")[0]["input"], "summarize")
+
     def test_subagent_root_takes_its_input_from_its_preamble(self):
         t0 = self.now - timedelta(hours=2)
         preamble = "[Subagent Context] You are running as a subagent (depth 1/2). Task: list open PRs."
@@ -911,6 +962,28 @@ class LangfuseExport(Base):
         reads = [g for g in self.lf.gets if g["route"] == "/api/public/v2/observations"]
         self.assertEqual(self.lf.duplicates(), [])
         self.assertLessEqual(len(reads), 4, f"12 traces checked in {len(reads)} reads")
+
+    def test_children_wait_for_their_tasks_row_so_every_span_carries_the_session(self):
+        sql = ('SELECT task_id, start, "end", request_text, status, \'sess-long\' AS session_id FROM agent.live '
+               'WHERE julianday("end") >= julianday(:since_iso) AND julianday("end") < julianday(:until_iso) '
+               'ORDER BY julianday("end") LIMIT :limit')
+        self.write_config(maxRows=5, tasksTimeColumn="end", rootSettleMinutes=10,
+                          queries={"tool_calls": TOOL_SQL, "model_calls": MODEL_SQL, "tasks": sql})
+        t0 = self.now - timedelta(hours=5)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('CREATE TABLE live (task_id, start, "end", request_text, status)')
+            conn.execute("INSERT INTO live VALUES (?,?,?,?,?)",
+                         ("long", iso(t0), iso(t0 + timedelta(minutes=30)), "a long task", "completed"))
+        for i in range(16):  # spread over several pages; the task's row comes with its last activity
+            self.add_tool("long", i, t0 + timedelta(minutes=2 * i))
+        results = self.wake()
+        self.assertGreater(len(results), 2)
+        self.assertTrue(any(r.get("childrenHeld") for r in results[:-1]), "children waited for the task's row")
+        self.assertEqual(results[-1]["childrenHeld"], 0)
+        spans = self.lf.spans
+        self.assertEqual(len(spans), 17)
+        self.assertEqual({s["attrs"].get("langfuse.session.id") for s in spans}, {"sess-long"})
+        self.assertEqual(self.lf.duplicates(), [])
 
     def test_resend_and_braintrust_reads_are_refused(self):
         self.add_tool("t1", 0, self.now - timedelta(hours=3))

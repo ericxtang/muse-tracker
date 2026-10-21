@@ -114,7 +114,7 @@ startup) refuses sources that differ from their version's record. To release:
 echo 0.0.2 > VERSION                # bump
 python3 build.py --release          # record the new sources
 python3 -m unittest discover -s tests
-railway up --service skill          # deploy; installs pick it up on their next wake
+git push origin main                # Railway deploys; installs pick it up on their next export
 ```
 
 Add an entry to `CHANGELOG.md` for people. Bump `SETUP_VERSION` in `build.py`

@@ -22,6 +22,7 @@ import tempfile
 import threading
 import unittest
 from unittest import mock
+import urllib.parse
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -124,6 +125,91 @@ class Braintrust:
         return [r for r in self.rows.values() if r["span_attributes"]["type"] == kind]
 
 
+class Langfuse:
+    """Mock Langfuse: OTLP ingestion that, like the real one, keeps every write
+    (a span sent twice is stored twice), plus the v2 observations read."""
+
+    AUTH = "Basic " + __import__("base64").b64encode(b"pk-test:sk-test").decode()
+
+    def __init__(self):
+        self.spans, self.posts, self.gets = [], [], []
+        self.fail_after_store = 0  # answer 500 after storing, as a server crash mid-response would
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def reply(self, code, body):
+                data = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                if self.headers.get("Authorization") != outer.AUTH:
+                    return self.reply(401, {"error": "unauthorized"})
+                route, _, raw = self.path.partition("?")
+                query = dict(urllib.parse.parse_qsl(raw))
+                outer.gets.append({"route": route, "query": query})
+                if route == "/api/public/projects":
+                    return self.reply(200, {"data": [{"id": "lf-project", "name": "LF Test"}]})
+                if route == "/api/public/v2/observations":
+                    rows = outer.spans
+                    if "traceId" in query:
+                        rows = [r for r in rows if r["traceId"] == query["traceId"]]
+                    if "filter" in query:
+                        [condition] = json.loads(query["filter"])
+                        rows = [r for r in rows if set(condition["value"]) & set(r["attrs"].get("langfuse.trace.tags", []))]
+                    lo = datetime.fromisoformat(query["fromStartTime"]).timestamp() * 1e9
+                    hi = datetime.fromisoformat(query["toStartTime"]).timestamp() * 1e9
+                    rows = [r for r in rows if lo <= r["start"] < hi][:int(query.get("limit", 50))]
+                    return self.reply(200, {"data": [{"id": r["spanId"], "traceId": r["traceId"]} for r in rows],
+                                            "meta": {"cursor": None}})
+                self.reply(404, {"error": "not found"})
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.headers.get("Authorization") != outer.AUTH:
+                    return self.reply(401, {"error": "unauthorized"})
+                if self.path != "/api/public/otel/v1/traces" or self.headers.get("x-langfuse-ingestion-version") != "4":
+                    return self.reply(400, {"error": "bad request"})
+                outer.posts.append(body)
+                for resource in body["resourceSpans"]:
+                    for scope in resource["scopeSpans"]:
+                        for span in scope["spans"]:
+                            attrs = {}
+                            for a in span["attributes"]:
+                                v = a["value"]
+                                attrs[a["key"]] = ([x.get("stringValue") for x in v["arrayValue"]["values"]]
+                                                   if "arrayValue" in v else next(iter(v.values())))
+                            outer.spans.append({"traceId": span["traceId"], "spanId": span["spanId"],
+                                                "parentSpanId": span.get("parentSpanId"), "name": span["name"],
+                                                "start": int(span["startTimeUnixNano"]),
+                                                "end": int(span["endTimeUnixNano"]),
+                                                "status": span.get("status"), "attrs": attrs})
+                if outer.fail_after_store:
+                    outer.fail_after_store -= 1
+                    return self.reply(500, {"error": "crashed after storing"})
+                self.reply(200, {})
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_port}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def of_type(self, kind):
+        return [r for r in self.spans if r["attrs"].get("langfuse.observation.type") == kind]
+
+    def duplicates(self):
+        ids = [r["spanId"] for r in self.spans]
+        return sorted({i for i in ids if ids.count(i) > 1})
+
+
 def iso(dt):
     return dt.isoformat(timespec="seconds")
 
@@ -166,6 +252,8 @@ class Base(unittest.TestCase):
     def cli(self, *args, script=CLI, expect=0):
         env = {**os.environ, "MUSE_TRACKER_STATE_DIR": str(self.tmp / "state"),
                "BRAINTRUST_API_KEY": "test-key", "BRAINTRUST_API_URL": self.bt.url, "BRAINTRUST_BTQL_SPACING": "0"}
+        if getattr(self, "lf", None):
+            env.update(LANGFUSE_HOST=self.lf.url, LANGFUSE_PUBLIC_KEY="pk-test", LANGFUSE_SECRET_KEY="sk-test")
         proc = subprocess.run([sys.executable, str(script), *args, "--config", str(self.config_path)],
                               capture_output=True, text=True, env=env)
         self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
@@ -285,6 +373,25 @@ class Export(Base):
         self.assertIn("lastBackfill", state)
         self.assertFalse(self.cli("backfill", "--days", "400")["due"], "already sent")
 
+    def test_task_fields_reach_the_root_and_survive_a_later_run(self):
+        self.write_config(queries={"tool_calls": TOOL_SQL, "model_calls": MODEL_SQL, "tasks": RICH_TASK_SQL})
+        t0 = self.now - timedelta(hours=2)
+        self.add_task("t1", t0, "plan the trip")
+        self.add_tool("t1", 0, t0 + timedelta(minutes=1))
+        self.wake()
+        [root] = self.bt.of_type("task")
+        self.assertEqual({k: root["metadata"].get(k) for k in ("session_id", "parent_task_id", "status", "kind")},
+                         {"session_id": "sess-1", "parent_task_id": "parent-9", "status": "done", "kind": "subagent"})
+        self.assertEqual(root["output"], "final answer")
+        # A later run sees only a new call; the rebuilt root keeps the task's fields.
+        state = self.state()
+        state["watermark"] -= 3_600_000
+        self.set_state(state)
+        self.add_tool("t1", 1, self.now - timedelta(minutes=40))
+        self.wake()
+        [root] = self.bt.of_type("task")
+        self.assertEqual((root["metadata"]["session_id"], root["output"]), ("sess-1", "final answer"))
+
     def test_subagent_root_takes_its_input_from_its_preamble(self):
         t0 = self.now - timedelta(hours=2)
         preamble = "[Subagent Context] You are running as a subagent (depth 1/2). Task: list open PRs."
@@ -364,7 +471,7 @@ class Export(Base):
         self.assertIsNotNone(self.cli("status")["watermark"])
 
     def test_unsupported_destination_is_refused(self):
-        self.write_config(destination="langfuse")
+        self.write_config(destination="datadog")
         self.assertEqual(self.cli("plan", expect=6)["code"], "SETUP_ERROR")
 
     def test_page_cut_keeps_rows_that_share_the_boundary_timestamp(self):
@@ -671,6 +778,116 @@ class Hook(Base):
         self.assertEqual(out[1].strip(), "SILENT|export not due")
         broken = subprocess.run(["bash", str(script), str(self.tmp / "missing.json")], capture_output=True, text=True, env=env)
         self.assertEqual((broken.returncode, broken.stdout.strip()), (0, "SILENT|export check failed; retry on the next invocation"))
+
+
+
+RICH_TASK_SQL = ("SELECT task_id, start, request_text, context_text, surface, 'sess-1' AS session_id, "
+                 "'parent-9' AS parent_task_id, 'done' AS status, 'subagent' AS kind, 'final answer' AS output_text "
+                 "FROM agent.tasks WHERE julianday(start) >= julianday(:since_iso) AND julianday(start) < julianday(:until_iso) "
+                 "ORDER BY julianday(start) LIMIT :limit")
+
+
+class LangfuseExport(Base):
+    def setUp(self):
+        super().setUp()
+        self.lf = Langfuse()
+        self.write_config()
+
+    def tearDown(self):
+        self.lf.close()
+        super().tearDown()
+
+    def write_config(self, **extra):
+        super().write_config(destination="langfuse", **{"queries": {"tool_calls": TOOL_SQL, "model_calls": MODEL_SQL,
+                                                                      "tasks": RICH_TASK_SQL}, **extra})
+
+    def test_check_reads_the_project_with_basic_auth(self):
+        result = self.cli("check")
+        self.assertEqual((result["destination"], result["projectName"]), ("langfuse", "LF Test"))
+
+    def test_spans_map_to_langfuse_observations(self):
+        t0 = self.now - timedelta(hours=5)
+        self.add_task("t1", t0, "summarize the inbox")
+        self.add_tool("t1", 0, t0 + timedelta(minutes=1), result="Authorization: Bearer abcdefghijklmnopqrstu")
+        self.add_tool("t1", 1, t0 + timedelta(minutes=2), result="boom", success=0)
+        self.add_model("t1", "m1", t0 + timedelta(minutes=3), 1200, 80)
+        [result] = self.wake()
+        self.assertEqual((result["rootsSent"], result["rootsHeld"]), (1, 0))
+        self.assertEqual(self.lf.duplicates(), [])
+        [root] = self.lf.of_type("agent")
+        [llm] = self.lf.of_type("generation")
+        tools = sorted(self.lf.of_type("tool"), key=lambda r: r["start"])
+        trace = hashlib.sha256(b"dot:t1").hexdigest()[:32]
+        self.assertTrue(all(r["traceId"] == trace for r in self.lf.spans))
+        self.assertEqual({r["parentSpanId"] for r in [llm] + tools}, {root["spanId"]})
+        self.assertIsNone(root["parentSpanId"])
+        self.assertEqual(json.loads(root["attrs"]["langfuse.observation.input"]), "summarize the inbox")
+        self.assertEqual(json.loads(root["attrs"]["langfuse.observation.output"]), "final answer")
+        self.assertEqual(json.loads(llm["attrs"]["langfuse.observation.usage_details"]), {"input": 1200, "output": 80})
+        self.assertEqual(llm["attrs"]["langfuse.observation.model.name"], "claude")
+        self.assertEqual((tools[1]["attrs"]["langfuse.observation.level"], tools[1]["status"]["code"]), ("ERROR", 2))
+        self.assertIn("[redacted]", tools[0]["attrs"]["langfuse.observation.output"])
+        self.assertNotIn("abcdefghijklmnopqrstu", json.dumps(self.lf.posts))
+        for span in self.lf.spans:  # trace-level attributes ride on every span
+            self.assertEqual(span["attrs"]["langfuse.session.id"], "sess-1")
+            self.assertEqual(span["attrs"]["langfuse.trace.metadata.parent_task_id"], "parent-9")
+            self.assertIn("muse-agent:dot", span["attrs"]["langfuse.trace.tags"])
+        self.assertAlmostEqual(root["start"] / 1e9, t0.timestamp(), delta=1)
+        self.assertGreaterEqual(root["end"], max(r["end"] for r in tools + [llm]))
+
+    def test_root_waits_until_the_task_is_idle_then_goes_once(self):
+        t0 = self.now - timedelta(minutes=50)
+        self.add_task("busy", t0, "still working")
+        self.add_tool("busy", 0, t0 + timedelta(minutes=1))
+        [first] = self.wake()
+        self.assertEqual((first["rootsSent"], first["rootsHeld"], len(self.lf.of_type("agent"))), (0, 1, 0))
+        self.assertEqual(len(self.lf.of_type("tool")), 1, "children go at once")
+        # The next run, after the task has been idle long enough.
+        self.write_config(rootSettleMinutes=10)
+        state = self.state()
+        state["watermark"] -= 3_600_000
+        self.set_state(state)
+        self.add_tool("busy", 1, t0 + timedelta(minutes=2))  # a late row the overlap picks up
+        self.wake()
+        self.assertEqual(len(self.lf.of_type("agent")), 1)
+        self.assertEqual(len(self.lf.of_type("tool")), 2)
+        self.assertEqual(self.lf.duplicates(), [], "the overlap re-read nothing that was already sent")
+        self.wake()
+        self.assertEqual(self.lf.duplicates(), [])
+
+    def test_lost_state_does_not_duplicate(self):
+        t0 = self.now - timedelta(hours=6)
+        for i in range(4):
+            self.add_task(f"t{i}", t0 + timedelta(minutes=i), f"job {i}")
+            self.add_tool(f"t{i}", i, t0 + timedelta(minutes=i, seconds=30))
+        self.wake()
+        stored = len(self.lf.spans)
+        import shutil
+        shutil.rmtree(self.tmp / "state")
+        self.wake()
+        self.assertEqual((len(self.lf.spans), self.lf.duplicates()), (stored, []),
+                         "the first run after lost state asks Langfuse what it already has")
+
+    def test_uncertain_send_is_checked_before_retry(self):
+        t0 = self.now - timedelta(hours=6)
+        self.add_task("t1", t0, "job")
+        self.add_tool("t1", 0, t0 + timedelta(minutes=1))
+        self.add_tool("t1", 1, t0 + timedelta(minutes=2))
+        self.lf.fail_after_store = 1
+        plan = self.cli("plan")
+        self.run_tool_queries(plan)
+        self.assertEqual(self.cli("export", expect=5)["code"], "SEND_UNCERTAIN")
+        stored = len(self.lf.spans)
+        self.assertGreater(stored, 0, "Langfuse kept the batch although it answered 500")
+        self.wake()
+        self.assertEqual(self.lf.duplicates(), [])
+        self.assertEqual(len(self.lf.of_type("tool")), 2)
+
+    def test_resend_and_braintrust_reads_are_refused(self):
+        self.add_tool("t1", 0, self.now - timedelta(hours=3))
+        self.wake()
+        self.assertEqual(self.cli("backfill", "--resend", "--days", "7", expect=2)["code"], "NOT_SUPPORTED")
+        self.assertEqual(self.cli("reconcile", "--since", "2026-01-01T00:00:00Z", expect=2)["code"], "NOT_SUPPORTED")
 
 
 class Release(Base):

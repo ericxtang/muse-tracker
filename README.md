@@ -4,9 +4,9 @@ A Muse skill that tracks what a Muse agent does (its tasks, model calls with
 token counts, and tool calls with inputs and outputs) and sends that record, on
 a schedule, to an observability tool as traces.
 
-**Destinations.** Braintrust is supported today. The skill is built to send to
-other tools too: the config's `destination` setting picks one, and the record
-model, scheduling, paging and duplicate handling do not depend on it. See
+**Destinations.** Braintrust and Langfuse are supported. The config's
+`destination` setting picks one; the record model, scheduling and paging are
+shared. See
 [Destinations](#destinations) for what is shared, what is Braintrust-specific
 today, and what a new tool must offer.
 
@@ -42,20 +42,24 @@ from before it was installed.
 | Destination | Status | How rows are written | Read-back for verification |
 | --- | --- | --- | --- |
 | [Braintrust](https://www.braintrust.dev) | Supported | `POST /v1/project_logs/<project>/insert`; replaces a row with the same `id` | BTQL (`reconcile`, `find`, `probe`) |
-| Others | Not yet | — | — |
+| [Langfuse](https://langfuse.com) | Supported | OTLP to `/api/public/otel/v1/traces`; stores every write, so each span is sent once | Not yet (use the Langfuse UI) |
+
+**The two differ in one way that shapes everything: Braintrust replaces a row
+sent again; Langfuse stores it again.** Against Braintrust the export can
+re-send freely (the overlap, retries, a root whose bounds grew). Against
+Langfuse it sends each span once: the sent registry is checked by id, a task's
+root waits until the task is idle, and runs that may repeat earlier sends ask
+Langfuse what it already holds. Details are in the
+[records reference](skills/muse-tracker/references/records.md#langfuse).
 
 **Shared by every destination:** the hook, scheduling, the `muse.db` queries
 and row contract, paging, the watermark, the record-derived ids, redaction, and
 the release and update machinery.
 
-**Braintrust-specific today**, and to be split behind `destination` when a
-second tool is added:
-
-- the row format (`event()` in the CLI writes Braintrust log rows);
-- transport and checks: `send`, `check`, `probe`, and the BTQL reads behind
-  `reconcile` and `find`;
-- the Secure Vault card (`custom.braintrust`, restricted to `api.braintrust.dev`)
-  and Setup step 1, which asks for a Braintrust key.
+**Per destination:** the transport and auth (`send`/`langfuse_send`), the
+row format (Braintrust log rows; OTLP spans with Langfuse attributes), the
+Secure Vault card (`custom.braintrust` or `custom.langfuse`), and `check`. The
+read-back commands (`reconcile`, `find`, `probe`) exist for Braintrust only.
 
 **What a new destination must offer:**
 
@@ -68,6 +72,8 @@ second tool is added:
    metrics for token counts.
 3. **An API key** that a Secure Vault card can hold, restricted to the tool's
    API host. Muse never sees the key; the vault adds it to each request.
+   Langfuse uses a key pair over Basic auth; whether Muse's vault offers a
+   Basic-auth card is not yet confirmed on a live Muse.
 4. **A way to read rows back** by id or trace, so `reconcile` can compare what
    `muse.db` holds with what the tool stored. Optional, but without it a
    destination cannot be verified.
@@ -164,7 +170,15 @@ python3 sample/make_sample.py      # writes sample/sample_muse.db (not committed
 
 ```sh
 python3 -m unittest discover -s tests -v
+python3 tests/e2e.py                 # end-to-end run of a built release; prints a report
 ```
+
+`tests/e2e.py` builds a release, publishes it to a mock GitHub, installs it as
+`setup.md` does, and drives the installed CLI the way a Muse worker does
+against a `muse.db` with the real table layout, once for a mock Braintrust and
+once for a mock Langfuse that keeps every write. It checks the mapping, the
+overlap, lost state, failed and uncertain sends, held roots, `reconcile`, and
+self-update, and exits non-zero if any check fails.
 
 The mock Braintrust stores rows by id with replace semantics; the queries run
 against a real SQLite file. Covered: a large first run across many pages, rows

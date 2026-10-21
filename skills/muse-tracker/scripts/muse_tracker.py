@@ -5,6 +5,7 @@ Standard library only. Every command prints one JSON object; failures print
 {"code", "message", ...} and exit nonzero.
 """
 import argparse
+import base64
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -44,9 +45,9 @@ REQUIRED_QUERIES = ("tool_calls", "model_calls")
 PARAM = re.compile(r":(since_iso|until_iso|since_ms|until_ms|limit)\b")
 DEFAULTS = {"intervalMinutes": 60, "overlapMinutes": 30, "settleMinutes": 0, "maxRows": 500,
             "maxAttributeChars": 8000, "maxPayloadBytes": 2_000_000, "maxPageBytes": 100_000,
-            "backfillDays": 7, "destination": "braintrust"}
+            "backfillDays": 7, "destination": "braintrust", "rootSettleMinutes": 120}
 # Observability tools this release can send to. The config's `destination` picks one.
-DESTINATIONS = ("braintrust",)
+DESTINATIONS = ("braintrust", "langfuse")
 # This skill's name before 0.0.6; `migrate` carries such an install over.
 LEGACY_SKILL = "braintrust-telemetry"
 # Tool mode passes every page through the agent's context, so its row limit
@@ -357,6 +358,10 @@ def root_request(task, seen, limit):
     return seen.get("request", ""), seen.get("requestSource") if seen.get("request") else None
 
 
+# Optional tasks columns carried into the root's metadata (see the row contract).
+TASK_FIELDS = ("agent_id", "surface", "session_id", "parent_task_id", "status", "kind", "model", "depth")
+
+
 def build_traces(rows, ledger, config):
     """Group rows by task_id. Returns (task_id, events, ledger_entry) per task."""
     limit = int(config["maxAttributeChars"])
@@ -388,7 +393,8 @@ def build_traces(rows, ledger, config):
                 seed = f"{start}:{name}:{hashlib.sha256(clean(tc.get('args'), 10**9).encode()).hexdigest()}"
             result = clean(tc.get("result"), limit)
             events.append(event(trace, hexid(f"{trace}:tool:{seed}", 16), root, name, "tool", start, end,
-                                {"task_id": task_id, "seq": as_int(tc.get("seq")), "success": ok},
+                                {"task_id": task_id, "seq": as_int(tc.get("seq")), "success": ok,
+                                 "server": tc.get("server")},
                                 input_=clean(tc.get("args"), limit), output=result,
                                 error=result or "tool call failed" if ok is False else None))
         for mc in entry["model_calls"]:
@@ -403,8 +409,11 @@ def build_traces(rows, ledger, config):
             if tokens:
                 tokens["tokens"] = sum(tokens.values())
             events.append(event(trace, hexid(f"{trace}:model:{seed}", 16), root, "model_call", "llm", at, end,
-                                {"task_id": task_id, "model": mc.get("model"), "message_id": mc.get("message_id"),
+                                {"task_id": task_id, "model": mc.get("model") or task.get("model"),
+                                 "message_id": mc.get("message_id"),
                                  "note": clean(mc.get("note"), limit) if mc.get("note") else None},
+                                input_=clean(mc["input_text"], limit) if mc.get("input_text") else None,
+                                output=clean(mc["output_text"], limit) if mc.get("output_text") else None,
                                 metrics=tokens))
         # A task can span runs. Its root row is rebuilt from the widest known
         # bounds and replaced in place; the ledger keeps what earlier runs saw.
@@ -414,12 +423,16 @@ def build_traces(rows, ledger, config):
             continue
         start, end = min(times), max(times)
         request, source = root_request(task, seen, limit)
-        metadata = {"task_id": task_id, "agent_id": task.get("agent_id") or seen.get("agent_id"),
-                    "surface": task.get("surface") or seen.get("surface"), "request_source": source}
-        root_event = event(trace, root, None, "agent_task", "task", start, end, metadata, input_=request or None)
+        # Task fields a later run may lack (its tasks row is outside that run's
+        # window) come from the ledger, so a rebuilt root keeps them.
+        kept = {key: task.get(key) if task.get(key) not in (None, "") else seen.get(key) for key in TASK_FIELDS}
+        metadata = {"task_id": task_id, "request_source": source, **kept}
+        answer = clean(task["output_text"], limit) if task.get("output_text") else seen.get("output")
+        root_event = event(trace, root, None, "agent_task", "task", start, end, metadata,
+                           input_=request or None, output=answer or None)
         out.append((task_id, [root_event] + sorted(events, key=lambda e: (start_ms(e), e["span_id"])),
-                    {"start": start, "end": end, "request": request[:2000], "requestSource": source,
-                     "agent_id": metadata["agent_id"], "surface": metadata["surface"]}))
+                    {"start": start, "end": end, "request": request, "requestSource": source,
+                     "output": answer or None, **kept}))
     return sorted(out, key=lambda t: (start_ms(t[1][0]), t[0]))
 
 
@@ -556,6 +569,249 @@ def send(config, events):
     if not isinstance(ids, list) or sorted(ids) != sorted(e["id"] for e in events):
         raise Failure("SEND_FAILED", "Braintrust did not confirm every row id; the page will be retried.", 5)
     return len(ids)
+
+
+# ---------- Langfuse ----------
+# Langfuse stores every write as a new row: a span sent twice with the same id
+# is stored twice. So nothing is sent twice. Children go once (the sent
+# registry is checked by id, not content); a task's root waits until the task
+# has been idle for rootSettleMinutes at the end of a run, then goes once; and
+# whenever a page may repeat an earlier send, Langfuse is asked which spans it
+# already has.
+
+LANGFUSE_CLOUD = ("cloud.langfuse.com", "us.cloud.langfuse.com", "jp.cloud.langfuse.com", "hipaa.cloud.langfuse.com")
+OTLP_PATH = "/api/public/otel/v1/traces"
+LANGFUSE_TYPES = {"task": "agent", "llm": "generation", "tool": "tool"}
+
+
+def langfuse(config):
+    return config.get("destination") == "langfuse"
+
+
+def langfuse_base(config):
+    if API_OVERRIDE_OK and os.environ.get("LANGFUSE_HOST"):
+        return os.environ["LANGFUSE_HOST"].rstrip("/")
+    url = str(config.get("langfuseHost") or "https://cloud.langfuse.com").rstrip("/")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname or parts.path not in ("", "/"):
+        raise Failure("SETUP_ERROR", "langfuseHost must be an https:// origin, e.g. https://cloud.langfuse.com.", 6)
+    return url
+
+
+def langfuse_authorize(request, config):
+    host = urllib.parse.urlsplit(langfuse_base(config)).hostname
+    if request.host.split(":")[0] != host:
+        raise Failure("INVALID_HOST", f"Requests must go to {host}.", 6)
+    provider = config.get("provider", "muse")
+    if provider == "env":
+        public, secret = os.environ.get("LANGFUSE_PUBLIC_KEY", ""), os.environ.get("LANGFUSE_SECRET_KEY", "")
+        if not public or not secret:
+            raise Failure("SETUP_ERROR", "Set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY for provider env.", 6)
+        token = base64.b64encode(f"{public}:{secret}".encode()).decode()
+        request.add_header("Authorization", "Basic " + token)
+        return
+    if provider != "muse":
+        raise Failure("SETUP_ERROR", "provider must be muse or env.", 6)
+    module = load_helper(config)
+    if not hasattr(module, "add_surrogate_to_request"):
+        raise Failure("VAULT_UNAVAILABLE", "This Muse's credentials helper cannot attach a Langfuse card.", 6)
+    try:
+        module.add_surrogate_to_request(request, config.get("connector") or "custom.langfuse", allowed_hosts=[host])
+    except Exception:
+        raise Failure("VAULT_UNAVAILABLE", "Could not obtain the Langfuse credential from the Secure Vault.", 6)
+
+
+def langfuse_request(config, method, path, body=None, query=None, write=False, retries=4):
+    """Call Langfuse. A 429 is retried (the request was refused, nothing
+    stored). A 5xx or network error on a write is not: Langfuse may have stored
+    it, so it is reported as SEND_UNCERTAIN and the retry checks first."""
+    url = langfuse_base(config) + path + ("?" + urllib.parse.urlencode(query) if query else "")
+    data = None if body is None else json.dumps(body, ensure_ascii=False).encode()
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if write:
+        headers["x-langfuse-ingestion-version"] = "4"
+    opener = urllib.request.build_opener(NoRedirect())
+    for n in range(retries + 1):
+        request = urllib.request.Request(url, data=data, method=method, headers=headers)
+        langfuse_authorize(request, config)
+        try:
+            with opener.open(request, timeout=60) as response:
+                raw = response.read()
+                return json.loads(raw) if raw.strip() else {}
+        except urllib.error.HTTPError as error:
+            detail = error.read()[:300].decode("utf-8", "replace")
+            if error.code == 429 and n < retries:
+                try:
+                    wait = min(float(error.headers.get("Retry-After") or 0), 60)
+                except ValueError:
+                    wait = 0
+                time.sleep(wait or 2 ** n)
+                continue
+            if error.code in (401, 403):
+                raise Failure("UNAUTHORIZED", "Langfuse rejected the API keys. Reconnect the Langfuse card.", 4, status=error.code)
+            if error.code >= 500:
+                if write:
+                    raise Failure("SEND_UNCERTAIN", f"Langfuse returned HTTP {error.code}; it may have stored the spans. "
+                                  "The page will be retried after checking.", 5, status=error.code)
+                if n < retries:
+                    time.sleep(2 ** n)
+                    continue
+            raise Failure("SEND_FAILED", f"Langfuse returned HTTP {error.code}.", 5, status=error.code, detail=detail)
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+            if write:
+                raise Failure("SEND_UNCERTAIN", "The connection to Langfuse failed mid-request; it may have stored the "
+                              "spans. The page will be retried after checking.", 5)
+            if n == retries:
+                raise Failure("NETWORK_ERROR", "Could not reach Langfuse; the page will be retried.", 5)
+            time.sleep(2 ** n)
+        except ValueError:
+            raise Failure("INVALID_RESPONSE", "Langfuse did not return JSON.", 5)
+
+
+def agent_tag(config):
+    return "muse-agent:" + str(config.get("agentId") or "muse")
+
+
+def trace_context(config, task_id, entry):
+    """Trace-level Langfuse attributes. Langfuse filters on them only when every
+    span carries them, so each span of a task gets the same set."""
+    kind = entry.get("kind")
+    tags = ["muse-tracker", agent_tag(config)] + [t for t in (kind, entry.get("requestSource")) if t]
+    attrs = {"langfuse.trace.name": f"muse {kind}" if kind else "muse task", "langfuse.trace.tags": tags,
+             "langfuse.trace.metadata.task_id": task_id}
+    for key in ("agent_id", "parent_task_id", "status", "surface"):
+        if entry.get(key) not in (None, ""):
+            attrs[f"langfuse.trace.metadata.{key}"] = str(entry[key])
+    if entry.get("session_id") not in (None, ""):
+        attrs["langfuse.session.id"] = str(entry["session_id"])[:199]
+    for field, attr in (("userId", "langfuse.user.id"), ("environment", "langfuse.environment")):
+        if config.get(field):
+            attrs[attr] = str(config[field])
+    attrs["langfuse.release"] = "muse-tracker " + VERSION
+    return attrs
+
+
+def otlp_value(value):
+    if isinstance(value, bool):
+        return {"boolValue": value}
+    if isinstance(value, int):
+        return {"intValue": str(value)}
+    if isinstance(value, float):
+        return {"doubleValue": value}
+    if isinstance(value, (list, tuple)):
+        return {"arrayValue": {"values": [otlp_value(v) for v in value]}}
+    return {"stringValue": str(value)}
+
+
+def json_text(value):
+    """Langfuse reads observation input/output as JSON; plain text becomes a JSON string."""
+    if isinstance(value, str):
+        try:
+            json.loads(value)
+            return value
+        except ValueError:
+            return json.dumps(value, ensure_ascii=False)
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def otlp_span(span, context):
+    """One canonical span as an OTLP span with Langfuse's attributes."""
+    kind = span["span_attributes"]["type"]
+    attrs = dict(context)
+    attrs["langfuse.observation.type"] = LANGFUSE_TYPES.get(kind, "span")
+    for field in ("input", "output"):
+        if span.get(field) not in (None, ""):
+            attrs[f"langfuse.observation.{field}"] = json_text(span[field])
+    metadata = {k: v for k, v in span["metadata"].items() if k != "model"}
+    for key, value in metadata.items():
+        attrs[f"langfuse.observation.metadata.{key}"] = value if isinstance(value, (str, bool, int, float)) else json.dumps(value)
+    if kind == "llm":
+        if span["metadata"].get("model"):
+            attrs["langfuse.observation.model.name"] = str(span["metadata"]["model"])
+        usage = {key: span["metrics"][metric] for metric, key in (("prompt_tokens", "input"), ("completion_tokens", "output"))
+                 if metric in span["metrics"]}
+        if usage:
+            attrs["langfuse.observation.usage_details"] = json.dumps(usage)
+    status = {"code": 0}
+    if span.get("error"):
+        attrs["langfuse.observation.level"] = "ERROR"
+        attrs["langfuse.observation.status_message"] = str(span["error"])[:1000]
+        status = {"code": 2, "message": str(span["error"])[:1000]}
+    out = {"traceId": span["root_span_id"], "spanId": span["span_id"], "name": span["span_attributes"]["name"],
+           "kind": 1, "startTimeUnixNano": str(round(span["metrics"]["start"] * 1000) * 1_000_000),
+           "endTimeUnixNano": str(round(span["metrics"]["end"] * 1000) * 1_000_000),
+           "attributes": [{"key": k, "value": otlp_value(v)} for k, v in attrs.items()], "status": status}
+    if span["span_parents"]:
+        out["parentSpanId"] = span["span_parents"][0]
+    return out
+
+
+def otlp_body(spans, contexts):
+    return {"resourceSpans": [{
+        "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "muse-tracker"}}]},
+        "scopeSpans": [{"scope": {"name": "muse-tracker", "version": VERSION},
+                        "spans": [otlp_span(s, contexts[s["root_span_id"]]) for s in spans]}]}]}
+
+
+def langfuse_send(config, spans, contexts):
+    result = langfuse_request(config, "POST", OTLP_PATH, otlp_body(spans, contexts), write=True)
+    rejected = ((result or {}).get("partialSuccess") or {}).get("rejectedSpans")
+    if rejected and int(rejected) > 0:
+        raise Failure("SEND_UNCERTAIN", f"Langfuse rejected {rejected} of {len(spans)} spans; the page will be retried "
+                      "after checking which arrived.", 5, detail=str(result.get("partialSuccess"))[:300])
+    return len(spans)
+
+
+def langfuse_observations(config, query):
+    """Every observation matching the query (core fields), following the cursor."""
+    out, cursor = [], None
+    for _ in range(50):
+        page = langfuse_request(config, "GET", "/api/public/v2/observations",
+                                query={**query, "fields": "core", "limit": 1000, **({"cursor": cursor} if cursor else {})})
+        out += page.get("data") or []
+        cursor = (page.get("meta") or {}).get("cursor")
+        if not cursor:
+            return out
+    raise Failure("TRACE_TOO_LARGE", "Too many observations to check; check the trace by hand.", 2)
+
+
+def langfuse_existing(config, spans):
+    """Span ids Langfuse already holds, checked per trace within the spans' time range."""
+    by_trace = {}
+    for s in spans:
+        by_trace.setdefault(s["root_span_id"], []).append(start_ms(s))
+    found = set()
+    for trace, starts in by_trace.items():
+        rows = langfuse_observations(config, {"traceId": trace, "fromStartTime": iso(min(starts) - 60_000),
+                                              "toStartTime": iso(max(starts) + 60_000)})
+        found |= {r.get("id") for r in rows}
+    return found
+
+
+def langfuse_has_agent_spans(config, since, until):
+    """Does Langfuse already hold any of this agent's spans in the window? One request."""
+    query = {"filter": json.dumps([{"type": "arrayOptions", "column": "tags", "operator": "any of",
+                                    "value": [agent_tag(config)]}]),
+             "fromStartTime": iso(since), "toStartTime": iso(until), "fields": "core", "limit": 1}
+    return bool(langfuse_request(config, "GET", "/api/public/v2/observations", query=query).get("data"))
+
+
+def langfuse_check(config):
+    projects = langfuse_request(config, "GET", "/api/public/projects").get("data") or []
+    if not projects:
+        raise Failure("PROJECT_NOT_FOUND", "These Langfuse keys are not tied to a project.", 6)
+    return {"ok": True, "destination": "langfuse", "host": langfuse_base(config),
+            "projectId": projects[0].get("id"), "projectName": projects[0].get("name")}
+
+
+def root_from_ledger(config, task_id, entry, limit):
+    """A task's root span, rebuilt from what the ledger kept."""
+    agent = str(config.get("agentId") or "muse")
+    trace = hexid(f"{agent}:{task_id}", 32)
+    metadata = {"task_id": task_id, "request_source": entry.get("requestSource"),
+                **{key: entry.get(key) for key in TASK_FIELDS}}
+    return event(trace, hexid(f"{trace}:root", 16), None, "agent_task", "task", entry["start"], entry["end"], metadata,
+                 input_=entry.get("request") or None, output=entry.get("output") or None)
 
 
 def fetch(url, timeout):
@@ -889,9 +1145,44 @@ def export_page(directory, config, queries, dry_run, output):
     traces = build_traces(rows, ledger, config)
     spans = [span for _, task_spans, _ in traces for span in task_spans]
     sent = state.get("sent", {})
-    fresh = [span for span in spans if sent.get(span_key(span)) != span_digest(span)]
-    # A span already sent with identical content is skipped; a changed one (a
-    # task root whose bounds grew) is sent again under the same id.
+    run = state["run"]
+    agent = str(config.get("agentId") or "muse")
+    contexts, task_of, roots_ready = {}, {}, []
+    if langfuse(config):
+        # Langfuse keeps every write, so nothing goes twice. Merge this page's
+        # tasks into the ledger first: a held root is rebuilt from it.
+        for task_id, _, entry in traces:
+            ledger[task_id] = {**ledger.get(task_id, {}), **entry, "seenAt": now}
+        fresh = [span for _, task_spans, _ in traces for span in task_spans[1:] if span_key(span) not in sent]
+        if not more:
+            # The run has read everything up to its end, so a task idle since
+            # well before then is finished: send its root now, once.
+            settle = int(config["rootSettleMinutes"]) * 60_000
+            roots_ready = [t for t, e in ledger.items() if not e.get("rootSent") and e["end"] <= cut - settle]
+        fresh += [root_from_ledger(config, t, ledger[t], int(config["maxAttributeChars"])) for t in roots_ready]
+        task_of = {hexid(f"{agent}:{t}", 32): t for t in [t for t, _, _ in traces] + roots_ready}
+        contexts = {trace: trace_context(config, t, ledger[t]) for trace, t in task_of.items()}
+        if fresh and not dry_run:
+            uncertain = set(state.get("uncertain") or [])
+            if "langfuseCheck" not in run:
+                # A regular run follows the registry. Any other run (the first,
+                # after lost state, or a backfill) may repeat earlier sends:
+                # one request asks whether Langfuse already has this agent's spans.
+                run["langfuseCheck"] = bool(run.get("backfill") or state.get("watermark") is None) and \
+                    langfuse_has_agent_spans(config, run["since"], run["until"])
+            check = [span for span in fresh if run["langfuseCheck"] or span["root_span_id"] in uncertain]
+            if check:
+                have = langfuse_existing(config, check)
+                for span in check:
+                    if span["span_id"] in have:
+                        sent[span_key(span)] = span_digest(span)
+                        if not span["span_parents"]:
+                            ledger[task_of[span["root_span_id"]]]["rootSent"] = True
+                fresh = [span for span in fresh if span["span_id"] not in have]
+    else:
+        fresh = [span for span in spans if sent.get(span_key(span)) != span_digest(span)]
+        # A span already sent with identical content is skipped; a changed one (a
+        # task root whose bounds grew) is sent again under the same id.
     batches = chunks(fresh, int(config["maxPayloadBytes"]))
     if dry_run:
         if output:
@@ -899,20 +1190,42 @@ def export_page(directory, config, queries, dry_run, output):
         return {"ok": True, "dryRun": True, "window": window_json({"since": page["since"], "until": cut}), "more": more,
                 "rows": {name: len(value) for name, value in rows.items()}, "traces": len(traces),
                 "spans": len(spans), "unsent": len(fresh), "requests": len(batches), "pages": 1, "output": output}
-    if not direct:
+    state["ledger"] = ledger
+    if not direct or langfuse(config):
         atomic_json(directory / "export.json", state)
     for batch in batches:
-        send(config, batch)
+        try:
+            if langfuse(config):
+                langfuse_send(config, batch, contexts)
+            else:
+                send(config, batch)
+        except Failure as failure:
+            if failure.payload["code"] == "SEND_UNCERTAIN":
+                # Langfuse may have stored this batch: the retry checks these traces first.
+                state["uncertain"] = sorted(set(state.get("uncertain") or []) | {span["root_span_id"] for span in batch})
+                atomic_json(directory / "export.json", state)
+            raise
         # Record each request as it lands, so a retry after a partial send skips it.
         for span in batch:
             sent[span_key(span)] = span_digest(span)
+            if langfuse(config) and not span["span_parents"]:
+                ledger[task_of[span["root_span_id"]]]["rootSent"] = True
         state["sent"] = sent
         atomic_json(directory / "export.json", state)
-    for task_id, _, entry in traces:
-        ledger[task_id] = {**entry, "seenAt": now}
+    state["uncertain"] = []
+    if not langfuse(config):
+        for task_id, _, entry in traces:
+            ledger[task_id] = {**entry, "seenAt": now}
+    # Full request and answer text is kept only while a root waits to be sent.
+    for entry in ledger.values():
+        if not langfuse(config) or entry.get("rootSent"):
+            for key in ("request", "output"):
+                if isinstance(entry.get(key), str) and len(entry[key]) > 2000:
+                    entry[key] = entry[key][:2000]
     if len(ledger) > LEDGER_LIMIT:
-        ledger = dict(sorted(ledger.items(), key=lambda kv: kv[1]["seenAt"])[-LEDGER_LIMIT:])
-    run = state["run"]
+        held = {k: v for k, v in ledger.items() if langfuse(config) and not v.get("rootSent")}
+        rest = sorted(((k, v) for k, v in ledger.items() if k not in held), key=lambda kv: kv[1]["seenAt"])
+        ledger = {**dict(rest[max(0, len(rest) - max(0, LEDGER_LIMIT - len(held))):]), **held}
     run.update(cursor=cut, pages=run["pages"] + 1, spans=run["spans"] + len(spans), sentSpans=run["sentSpans"] + len(fresh))
     summary = {"at": now, "since": iso(run["since"]), "until": iso(run["until"]), "pages": run["pages"],
                "spans": run["spans"], "sentSpans": run["sentSpans"]}
@@ -936,6 +1249,9 @@ def export_page(directory, config, queries, dry_run, output):
         shutil.rmtree(rows_dir(directory, page), ignore_errors=True)
     result = {"ok": True, **summary, "traces": len(traces), "pageSpans": len(spans), "pageSent": len(fresh), "more": more,
               **({"backfill": True} if run.get("backfill") else {})}
+    if langfuse(config):
+        result.update(rootsSent=sum(1 for t in roots_ready if ledger.get(t, {}).get("rootSent")),
+                      rootsHeld=sum(1 for e in ledger.values() if not e.get("rootSent")))
     if not direct:
         result.update(pageBytes=page_bytes, nextPageRows=page_limit(config, state))
     return result
@@ -1240,7 +1556,9 @@ def status(config_path, config):
                               "pages": run["pages"]} if run else None,
             "lastExport": state.get("lastExport"), "failure": state.get("failure"),
             "updateFailure": state.get("updateFailure"),
-            "sentRegistry": len(state.get("sent", {})),
+            "sentRegistry": len(state.get("sent", {})), "destination": config.get("destination"),
+            **({"rootsHeld": sum(1 for e in state.get("ledger", {}).values() if not e.get("rootSent"))}
+               if langfuse(config) else {}),
             "lagMinutes": round((now_ms() - watermark) / 60_000, 1) if watermark else None,
             "stats": state.get("stats", {}), "nextPageRows": page_limit(config, state),
             "nextDue": iso(timer["nextDue"]) if timer.get("nextDue") else None,
@@ -1357,7 +1675,10 @@ def main():
     global API_OVERRIDE_OK
     API_OVERRIDE_OK = config.get("provider") == "env"
     if args.command == "check":
-        return check(config)
+        return langfuse_check(config) if langfuse(config) else check(config)
+    if args.command in ("probe", "reconcile", "find") and langfuse(config):
+        raise Failure("NOT_SUPPORTED", f"{args.command} reads back from Braintrust; it is not available for Langfuse yet. "
+                      "Use the Langfuse UI to inspect traces.", 2)
     if args.command == "plan":
         return plan(path, config)
     if args.command == "export":
@@ -1372,6 +1693,9 @@ def main():
         return find(config, args.marker, args.hours)
     if args.command == "backfill":
         only = [name.strip() for name in args.only.split(",") if name.strip()] if args.only else None
+        if args.resend and langfuse(config):
+            raise Failure("NOT_SUPPORTED", "Langfuse stores every write, so a resend would duplicate rows. "
+                          "To redo traces, delete them in Langfuse first, then backfill.", 2)
         return backfill(path, config, args.since, args.days, args.resend, only)
     return hook(path, config, args.dry_run)
 

@@ -8,9 +8,20 @@ with the same `task_id` become one trace. Unknown extra columns are ignored.
 
 | Query | Required | Optional |
 | --- | --- | --- |
-| `tool_calls` | `task_id`, `tool`, `started_at` | `id` or `seq` (stable per call), `ended_at`, `args`, `result`, `success` |
-| `model_calls` | `task_id`, `at` | `message_id` or `id`, `ended_at`, `input_tokens`, `output_tokens`, `model`, `note` |
-| `tasks` | `task_id`, `start` | `end`, `request_text`, `context_text`, `agent_id`, `surface` |
+| `tool_calls` | `task_id`, `tool`, `started_at` | `id` or `seq` (stable per call), `ended_at`, `args`, `result`, `success`, `server` |
+| `model_calls` | `task_id`, `at` | `message_id` or `id`, `ended_at`, `input_tokens`, `output_tokens`, `model`, `output_text`, `input_text`, `note` |
+| `tasks` | `task_id`, `start` | `end`, `request_text`, `context_text`, `output_text`, `agent_id`, `surface`, `session_id`, `parent_task_id`, `status`, `kind`, `model`, `depth` |
+
+Where the optional columns come from in `muse.db` (see `sample/schema.sql`):
+
+| Column | Source | Used for |
+| --- | --- | --- |
+| `session_id` | `agent.agents.root_session_id`, else `session_id` | Groups a conversation with its subagents (Langfuse sessions) |
+| `parent_task_id` | `agent.agents.parent_agent_id` | Which agent spawned a subagent |
+| `output_text` (tasks) | `agent.agents.last_assistant_message` | The task's final answer, the root's output |
+| `status`, `kind`, `model`, `depth` | `agent.agents` (`kind` or `agent_type`) | Filtering; `kind` names the trace in Langfuse |
+| `output_text` (model calls) | `runtime.messages.body` for the usage row's `message_id` | The message the tokens paid for |
+| `server` | `runtime.tool_calls.server_name` | Which MCP server a tool came from |
 
 - Times may be ISO-8601 strings or epoch seconds/ms/µs/ns.
 - `success` may be boolean, `0`/`1` or text such as `"ok"`/`"error"`. Leave it
@@ -137,11 +148,56 @@ exponential backoff, honoring `Retry-After`. Requests stay under
 
 Children carry `span_parents: [<root span_id>]`; times are unix seconds.
 
+### Langfuse
+
+Spans go as OTLP/HTTP JSON to `<langfuseHost>/api/public/otel/v1/traces` with
+`x-langfuse-ingestion-version: 4` and Basic auth (public key : secret key). The
+trace id and span ids are the same as for Braintrust (32 and 16 hex characters),
+so a task is one Langfuse trace.
+
+| Our span | Langfuse observation | Attributes |
+| --- | --- | --- |
+| Task root | `agent` | `input` (request or preamble), `output` (`output_text`), task metadata |
+| Model call | `generation` | `model.name`, `usage_details` `{input, output}`, `output` (message text) |
+| Tool call | `tool` | `input` = args, `output` = result; a failure sets level `ERROR` and `status_message` |
+
+Every span also carries the trace-level attributes, which Langfuse filters on
+only when all spans have them: `langfuse.trace.name` (`muse <kind>`),
+`langfuse.session.id` (`session_id`), `langfuse.trace.tags` (`muse-tracker`,
+`muse-agent:<agentId>`, `kind`, `request_source`), `langfuse.trace.metadata.*`
+(`task_id`, `agent_id`, `parent_task_id`, `status`, `surface`),
+`langfuse.release`, and `langfuse.user.id` / `langfuse.environment` when the
+config sets `userId` / `environment`.
+
+**Each span is sent once.** Langfuse stores every write: a span sent again
+with the same id is stored again ([docs](https://langfuse.com/faq/all/tracing-data-updates)).
+
+- Children are sent the first time they are seen; the sent registry is checked
+  by id, so the overlap re-reads nothing twice.
+- A task's root is held in the ledger until a run reaches the present and the
+  task has been idle for `rootSettleMinutes`, then sent once with its final
+  bounds. Activity after that (a task resumed hours later) still arrives as
+  children of the same root, but the root's own end time does not move.
+- A run that may repeat earlier sends (the first run, after lost state, or a
+  backfill) asks Langfuse once whether it already holds this agent's spans in
+  the window; if so, each trace is checked before sending.
+- A write that fails without an answer (5xx, timeout) may have been stored: the
+  page fails with `SEND_UNCERTAIN`, and its retry checks those traces first.
+- `backfill --resend` is refused; to redo traces, delete them in Langfuse first.
+  `reconcile`, `find` and `probe` read back from Braintrust only.
+
+Plan limits to know ([limits](https://langfuse.com/faq/all/api-limits)): Hobby
+shows 30 days of data (older data is kept but hidden), allows 1,000 ingestion
+requests and 30 reads a minute, and 50 delete requests a day.
+
 ## Config
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `destination` | `braintrust` | The observability tool to send to; `braintrust` is the only one supported so far |
+| `destination` | `braintrust` | The observability tool to send to: `braintrust` or `langfuse` |
+| `langfuseHost` | `https://cloud.langfuse.com` | Langfuse origin (`us.`, `jp.`, `hipaa.` cloud regions, or self-hosted) |
+| `rootSettleMinutes` | 120 | Langfuse: how long a task must be idle before its root is sent |
+| `userId`, `environment` | none | Langfuse: sent as the trace's user and environment |
 | `provider` | `muse` | `muse` uses the Secure Vault; `env` reads `BRAINTRUST_API_KEY` (local testing) |
 | `connector` | `custom.braintrust` | Vault connector name |
 | `helperPath` | built-in | Path to Muse's `dynamic_credentials.py` |

@@ -17,9 +17,16 @@ on a schedule. Routine exports stay silent. Every row has an id derived from the
 record, and the destination replaces a row sent again with the same id, so
 re-sending never creates duplicates.
 
-The config's `destination` names the tool. The only one supported so far is
-`braintrust` (a Braintrust project, reached through the `custom.braintrust`
-Secure Vault card); the steps below describe it.
+The config's `destination` names the tool: `braintrust` (a Braintrust
+project, through the `custom.braintrust` Secure Vault card) or `langfuse` (a
+Langfuse project, through `custom.langfuse`). The steps below describe
+Braintrust and note where Langfuse differs.
+
+**Langfuse keeps every write.** Unlike Braintrust, it never replaces a row: a
+span sent twice is stored twice. The CLI therefore sends each span once. A
+task's root span waits until the task has been idle for `rootSettleMinutes`
+(120) at the end of a run, and runs that may repeat earlier sends ask Langfuse
+first. Never re-send Langfuse data by any other route.
 
 Release origin: **{{BASE_URL}}**. Use the bundled [CLI](scripts/muse_tracker.py)
 for every step; it needs only Python 3's standard library. Read
@@ -41,7 +48,12 @@ and Secure Vault card. Then re-read this file and run `setup-check`, which must
 report `ok: true`. Never install or replace files by hand while `self-update`
 works.
 
-1. **Connection.** Exports use one Secure Vault card, connector
+0. **Destination.** Use the tool the person named. Otherwise, if exactly one of
+   `custom.braintrust` and `custom.langfuse` exists as a working card or
+   connector folder, use that one. Ask (Braintrust or Langfuse) only when
+   neither or both exist.
+
+1. **Connection (Braintrust).** Exports use one Secure Vault card, connector
    `custom.braintrust`, restricted to `api.braintrust.dev`. If that card already
    exists, reuse it and go to step 2; request a card only if `check` fails with
    `UNAUTHORIZED` or `VAULT_UNAVAILABLE`. Never replace a working card. Do not
@@ -65,6 +77,18 @@ works.
    A key pasted into chat is never used or stored; ask for a new one. When the
    person says the key was replaced, show the card again with `reconnect: true`.
 
+   **Connection (Langfuse).** Langfuse authenticates with HTTP Basic auth: the
+   project's public key as the username and its secret key as the password.
+   Find the host: `https://cloud.langfuse.com` (EU), `https://us.cloud.langfuse.com`,
+   `https://jp.cloud.langfuse.com`, `https://hipaa.cloud.langfuse.com`, or the
+   person's own server. Request a card with connector `custom.langfuse`,
+   provider `langfuse`, `api_hosts` set to that one host name, and Basic auth.
+   If `credentials.request_api_access` offers no Basic scheme, stop and tell
+   the person Langfuse cannot be connected from this Muse yet; never store the
+   keys anywhere else. Tell them in one line: **Create a key pair at Langfuse →
+   Project settings → API keys, tap Connect and enter both there. Never paste
+   them into this chat.**
+
 2. **Config.** Setup uses defaults and asks nothing it can find out itself.
    For the project: if an existing Braintrust connector, its notes (for
    example `custom-connectors/custom.braintrust/CONNECTOR.md`) or an earlier
@@ -84,6 +108,10 @@ works.
      "queries": {}
    }
    ```
+
+   For Langfuse, write `"destination": "langfuse"`, `"connector": "custom.langfuse"`
+   and `"langfuseHost"` instead of `projectId`: the keys belong to one project.
+   `check` then reads that project and returns its name.
 
    The first export sends the **past 7 days** (`backfillDays`). Do not ask
    how far back to go; older history is one [backfill](#older-history) away
@@ -108,7 +136,12 @@ works.
    message (subagents, hook workers): `request_text` from the first user
    message and `context_text` from the preamble the agent started with (a
    subagent's begins `[Subagent Context]`), so every root shows what that
-   agent was asked to do. Give it `end` and `LIMIT :limit` too.
+   agent was asked to do. Give it `end` and `LIMIT :limit` too. Fill the
+   optional columns `muse.db` can supply (join `agent.agents` and
+   `runtime.messages`): `session_id`, `parent_task_id`, `status`, `kind`,
+   `model`, `depth` and `output_text` on tasks, `output_text` on model calls,
+   `server` on tool calls. They group a conversation with its subagents and
+   show each agent's answer.
 
    If the `muse.db` tables are SQLite files readable from your shell, add
    `databases` (schema name → absolute file path, for example
@@ -248,6 +281,12 @@ the person; stay silent unless one fails. Each change is safe to repeat.
   in history), as [the reference](references/records.md#leave-out-this-skills-own-runs)
   describes, and check the queries with a dry run. An install still named
   `braintrust-telemetry` moves over with `setup.md` first (it runs `migrate`).
+- **Setup version 4 (0.0.8): more of `muse.db` in each trace.** Add the
+  optional columns Setup step 3 now lists (`session_id`, `parent_task_id`,
+  `status`, `kind`, `model`, `depth`, `output_text`, `server`) to the saved
+  queries where `muse.db` has them, and check with a dry run. For Braintrust,
+  roots already sent pick them up as their tasks are seen again; nothing else
+  needs re-sending.
 
 ## Verification
 

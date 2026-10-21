@@ -3,6 +3,20 @@
 Versions follow MAJOR.MINOR.PATCH. `releases.json` records the source digest of
 each version; the build refuses sources that do not match their version.
 
+## 0.0.8 — 2026-10-21
+
+- **Langfuse destination** (`"destination": "langfuse"`). Spans go to
+  Langfuse's OTLP endpoint as `agent`, `generation` and `tool` observations
+  with input, output, model, token usage, error level and trace-level session,
+  tags and metadata. Langfuse stores every write, so each span is sent once:
+  children on first sight, a task's root once the task is idle
+  (`rootSettleMinutes`), and runs that may repeat earlier sends check Langfuse
+  first. A send that fails without an answer is checked before its retry.
+- More of `muse.db` in every trace, for both destinations: optional
+  `session_id`, `parent_task_id`, `status`, `kind`, `model`, `depth` and
+  `output_text` on tasks, `output_text` on model calls, `server` on tool calls.
+- Setup version 4: saved queries add those columns.
+
 ## 0.0.7 — 2026-10-21
 
 - Releases are GitHub releases of the public `ericxtang/muse-tracker` repo;

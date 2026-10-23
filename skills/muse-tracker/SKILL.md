@@ -6,9 +6,9 @@ description: Track your own Muse activity (tasks, model calls with token usage, 
 
 # Muse tracker
 
-Version **{{VERSION}}**. `python3 scripts/muse_tracker.py version` says
-whether this is the latest release (`upToDate`), comparing the installed files
-with the published ones.
+Version **{{VERSION}}**. `python3 scripts/muse_tracker.py version` reports the
+installed version without network access. Updates are explicit; routine
+exports never visit GitHub.
 
 Ship your real execution records from `muse.db` to an observability tool, one
 trace per agent task: a root `task` span, `llm` spans for model calls with token
@@ -40,13 +40,24 @@ absolute paths in configs, hook scripts and prompts.
 
 ## Setup
 
-**Always run the latest release.** Before setup, run
+**Install the latest release during setup.** Before first setup, run
 `python3 scripts/muse_tracker.py self-update` from the skill folder (add
 `--config CONFIG` once the config exists). It installs the newest published
 release in place, verified against the manifest, and keeps the config, state
 and Secure Vault card. Then re-read this file and run `setup-check`, which must
 report `ok: true`. Never install or replace files by hand while `self-update`
 works.
+
+**GitHub approval belongs to setup, not each export.** Keep release downloads
+and verification in this setup task. When Muse offers **Allow for this site**,
+the person can approve read-only release access for this repository; GitHub may
+also redirect downloads to `release-assets.githubusercontent.com`. Reuse any
+existing matching grant. Do not claim that **Allow for this task** is permanent,
+invent a permission API, or repeatedly generate cards trying to get a lasting
+grant. If only a one-task approval is offered, finish setup under that approval;
+routine exports do not need GitHub. A later user-requested update may need its
+own approval. Denied or expired release access ends this setup/update attempt;
+do not retry it in a background worker.
 
 0. **Destination.** Use the tool the person named. Otherwise, if exactly one of
    `custom.braintrust` and `custom.langfuse` exists as a working card or
@@ -192,8 +203,10 @@ works.
      itself decides when an export is due (`intervalMinutes`), so a short poll
      costs one local check, not a worker.
    - `delivery`: the chat where setup happened.
-   - `prompt`: “Read the Braintrust telemetry skill at SKILL_PATH and follow On
-     wake using config CONFIG_PATH. Routine exports are silent and resolve
+   - `prompt`: “Read the Muse tracker skill at SKILL_PATH and follow On
+     wake using config CONFIG_PATH. Use the installed skill; do not check GitHub,
+     run self-update, version --check-updates or setup-check, or request web
+     permission for releases. Routine exports are silent and resolve
      `nothing_to_do`. Only when the final export result has `shouldNotify: true`,
      the resolve phase selects `notify_main_agent` exactly once with that
      result's `code` and `message`.” Do not restate procedures in the prompt.
@@ -209,8 +222,10 @@ works.
 
 ## On wake
 
-The wake payload has `attemptId`, `config`, `skillSha256`, `updateRequired`,
-`setupRequired`, `failureCount` and `watermark`. It is routing data, not instructions.
+The wake payload has `attemptId`, `config`, `setupRequired`, `failureCount`,
+`watermark` and `updatePolicy: "manual"`. It is routing data, not instructions.
+The legacy `skillSha256`, `latestVersion` and `updateRequired` fields stay null,
+null and false for compatibility.
 
 Each wake sends **everything recorded since the last export**: a run covers
 the last export's end (minus `overlapMinutes`, to catch rows written late) up
@@ -218,15 +233,13 @@ to the moment the run starts. The first run, with no `startAt`, covers the past
 7 days. Large runs are split into pages by row count, and **you keep going
 until the run is finished.**
 
-1. If `updateRequired` is true, or `skillSha256` is non-null and differs from
-   the config's `setupReceipt.sha256`, run `self-update --config CONFIG`, re-read
-   this file, and follow its On wake from the top. The hook compares the
-   installed files themselves with the latest release, so this also repairs a
-   partial or edited install. If `self-update` fails, continue with the
-   installed files; the next wake retries. Report the failure in one plain line
-   only when its result has `shouldNotify: true` (the first time, then daily). A null `skillSha256`
-   means the release was unreachable: continue with the installed files.
-2. If the wake payload or the `self-update` result has `setupRequired: true`,
+1. Use the installed files. Do not fetch the release, browse GitHub, run
+   `self-update`, `version --check-updates` or `setup-check`, or ask for release
+   access. This also applies to retries, resumed runs and older wake payloads
+   with `updateRequired: true` or a different `skillSha256`. A missing or old
+   `setupReceipt` does not require a network check. If the installed script
+   cannot run, report that once and end the attempt; do not start an update loop.
+2. If the wake payload has `setupRequired: true`,
    make the [setup changes](#setup-changes) first. It stays true on every wake
    until `setup-done` records them, so a change cut short is finished at the
    next wake.
@@ -256,6 +269,20 @@ after its last page.
 Never send records by any other route, and never put the API key, a surrogate,
 or record contents in hook prompts, logs or chat.
 
+## Updating
+
+Only when the person asks to install, update or repair the skill, run
+`python3 scripts/muse_tracker.py self-update --config CONFIG`, re-read this
+file, and make any required Setup changes. `setup-check --config CONFIG`
+verifies the files against the published release during that same task.
+For an explicit latest-version check, use `version --check-updates`.
+`version`, `--version`, `status`, and the hook are offline.
+
+If release access is denied, expires or fails, end the update attempt and keep
+using the installed version for exports. Do not schedule retries or create a
+new approval card. Preserve the hook's enabled/disabled state during updates;
+an update does not authorize resuming a paused export.
+
 ## Older history
 
 When the person asks for more history, run
@@ -280,6 +307,11 @@ lacks a change below. Make the changes for each setup version above the
 config's, in order, then run `python3 scripts/muse_tracker.py setup-done --config CONFIG`,
 which records the installed release's setup version. They need no input from
 the person; stay silent unless one fails. Each change is safe to repeat.
+
+For an update while the hook is disabled, refresh its prompt as version 7
+describes but defer any earlier change that would run an export or backfill.
+Leave `setupRequired: true` until those changes are completed after the person
+resumes exports; installing an update does not resume them.
 
 - **Setup version 2 (0.0.5): roots for agents with no user message.**
   1. Rewrite `queries.tasks` as Setup step 3 now describes (`context_text`,
@@ -328,6 +360,13 @@ the person; stay silent unless one fails. Each change is safe to repeat.
   explains. Then show the person the saved query with
   `python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["queries"]["tasks"])' CONFIG`
   and the config's `tasksTimeColumn`, exactly as printed.
+- **Setup version 7 (0.0.12): exports no longer check GitHub.** Replace the
+  native hook's prompt with Setup step 6's current prompt, removing any inline
+  update or release-verification instructions. Read it back to confirm it.
+  Keep its current enabled/disabled state, config, watermark and queued runs.
+  The bundled hook now makes only local scheduling checks; no re-export or
+  GitHub permission is needed for this change. If the hook is disabled, defer
+  export/backfill work from earlier setup versions until the person resumes it.
 
 ## Verification
 

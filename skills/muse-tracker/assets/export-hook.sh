@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One native invocation. Decides whether an export is due; never loads credentials.
+# One offline native invocation. Decides whether an export is due; no credentials.
 set -uo pipefail
 source "${HATCH_HOOK_RUNTIME:?Run this script through the Muse native hook runtime}"
 config=${1:?usage: export-hook.sh ABSOLUTE_CONFIG_PATH [--dry-run]}

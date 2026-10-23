@@ -252,7 +252,7 @@ def main():
         with zipfile.ZipFile(__import__("io").BytesIO(archive)) as z:
             z.extractall(home / "skills")
         run.script = home / "skills" / "muse-tracker" / "scripts" / "muse_tracker.py"
-        info = subprocess.run([sys.executable, str(run.script), "version"], capture_output=True, text=True,
+        info = subprocess.run([sys.executable, str(run.script), "version", "--check-updates"], capture_output=True, text=True,
                               env=run.env(run.tmp / "state")).stdout
         run.check("Install", "installed copy reports upToDate", json.loads(info)["upToDate"], info.strip()[:90])
 
@@ -453,12 +453,16 @@ def main():
         with (source / "SKILL.md").open("a") as f:
             f.write("\nnext release\n")
         nxt = build.build(run.github.url, run.github.static, source=source, version="9.9.9")
+        reads = len(run.github.gets)
         payload = run.cli(configs["braintrust"], "hook", "--dry-run")["payload"]
+        run.check("Update", "hook remains offline when a newer release is available",
+                  len(run.github.gets) == reads and not payload["updateRequired"] and payload["updatePolicy"] == "manual",
+                  "0 release requests")
         updated = run.cli(configs["braintrust"], "self-update")
-        info = json.loads(subprocess.run([sys.executable, str(run.script), "version"], capture_output=True, text=True,
+        info = json.loads(subprocess.run([sys.executable, str(run.script), "version", "--check-updates"], capture_output=True, text=True,
                                          env=run.env(run.tmp / "state")).stdout)
-        run.check("Update", "hook sees the new release; self-update installs and verifies it",
-                  payload["updateRequired"] and updated["updated"] and info["installed"] == "9.9.9" and info["upToDate"],
+        run.check("Update", "explicit self-update installs and verifies the new release",
+                  updated["updated"] and info["installed"] == "9.9.9" and info["upToDate"],
                   f"{payload['installedVersion']} → {info['installed']}, upToDate {info['upToDate']}")
     except Exception as error:  # report, don't hide
         run.check("Run", "completed without an exception", False, f"{type(error).__name__}: {str(error)[:300]}")

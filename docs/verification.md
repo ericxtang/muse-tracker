@@ -67,7 +67,7 @@ I can read it. Messages in quotes go to Muse.
 
    | Pass | Where |
    | --- | --- |
-   | `upToDate: true`, `installed` = `latest` | `version` |
+   | `installed` is the version installed at setup, `updatePolicy: "manual"`; no GitHub request | `version` |
    | `projectName` is your project | `check` |
    | `watermark` set, `runInProgress: null`, `failure: null` | `status` |
    | id `muse-tracker`, enabled, poll 300 s, delivery = this chat, prompt names the skill and config paths | hook |
@@ -130,7 +130,8 @@ affected time.
 | **Interrupt a run.** Ask "Run the export now", then press stop while it is paging. | `status` shows `runInProgress`. About 15 minutes after the last page, the hook resumes it and `runInProgress` returns to `null`. |
 | **Lose local state.** Ask Muse to delete the directory `status` reports as `stateDir`, then run the export. | It re-sends the past 7 days. Reconcile: `duplicates: 0`. |
 | **Ask for older history.** "Send my Muse activity from the past 30 days to Braintrust." | Muse estimates the pages, runs `backfill --days 30` and pages through it; `status` → `historyFrom` moves back 30 days; reconcile over days 8–30 is clean, and the hourly export keeps running. |
-| **Ship an update.** Tell me "release 0.0.5". | At the next wake the hook reports `installedVersion` 0.0.4 → `latestVersion` 0.0.5. Muse updates itself, `version` says `upToDate: true`, and exports continue. |
+| **Ship an update.** Publish a newer release, then ask Muse to update explicitly. | Before the explicit request, exports continue using the installed release with no GitHub access. `self-update` installs the new release; `version --check-updates` says `upToDate: true`. A disabled hook stays disabled. |
+| **No standing GitHub grant.** Complete setup with only a one-task web approval, then let several export wakes run. | No new GitHub request from hook polls, dry runs, status/version checks, export pages or recovery wakes. Braintrust/Langfuse exports continue. Check the actual Muse approval history; mock tests alone do not verify Muse's permission UI. |
 
 ## 6. Soak (7 days)
 

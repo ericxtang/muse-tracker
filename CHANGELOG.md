@@ -3,6 +3,23 @@
 Versions follow MAJOR.MINOR.PATCH. `releases.json` records the source digest of
 each version; the build refuses sources that do not match their version.
 
+## 0.0.12 — 2026-10-23
+
+- **Stop recurring GitHub permission prompts.** Hook polls, dry runs and
+  export wakes use the installed skill without checking GitHub. Updates now
+  happen only on request with `self-update`; `version` is offline unless
+  called with `--check-updates`. Missing setup receipts and old wake payloads
+  must not start background update attempts.
+- An abandoned export now honors the retry timer after a recovery wake,
+  preventing another worker from starting on every five-minute poll while
+  the first one has not made progress.
+- Release fetches use stable URLs with cache-revalidation headers instead of
+  random query strings. Archive and file hash verification is preserved.
+- Setup version 7 refreshes the hook prompt to prohibit background release
+  checks and preserves a paused hook's disabled state. Setup explains the
+  difference between Muse's site approval and a one-task approval, and stops
+  when release access is denied or expires instead of creating more cards.
+
 ## 0.0.11 — 2026-10-21
 
 - **An agent that is still active keeps its root.** The tasks query's `end` now

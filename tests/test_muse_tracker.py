@@ -797,7 +797,8 @@ class Hook(Base):
         first = self.cli("hook")
         self.assertEqual(first["decision"], "wake")
         self.assertEqual(first["payload"]["config"], str(self.config_path.resolve()))
-        self.assertIsNone(first["payload"]["skillSha256"], "unbuilt skill has no manifest")
+        self.assertIsNone(first["payload"]["skillSha256"], "routine hooks do not check releases")
+        self.assertEqual(first["payload"]["updatePolicy"], "manual")
         self.assertEqual(self.cli("hook")["decision"], "silent")
 
     def test_finished_export_sets_next_slot(self):
@@ -830,6 +831,46 @@ class Hook(Base):
         with (lock_dir / "export.lock").open("a") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
             self.assertEqual(self.cli("hook")["reason"], "export running")
+
+    def test_abandoned_run_waits_between_resume_attempts_and_dry_runs_preserve_timer(self):
+        spec = importlib.util.spec_from_file_location("tracker_schedule", CLI)
+        tracker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tracker)
+        directory = self.tmp / "schedule"
+        directory.mkdir()
+        now = 1_000_000_000
+        (directory / "export.json").write_text(json.dumps({"run": {"touchedAt": now - 16 * 60_000}}))
+        timer = directory / "timer.json"
+        config = {"intervalMinutes": 60}
+        with mock.patch.object(tracker, "now_ms", return_value=now) as clock:
+            self.assertEqual(tracker.due_wake(directory, self.config_path, config, True)["decision"], "wake")
+            self.assertFalse(timer.exists(), "a setup dry run does not create a schedule")
+            self.assertEqual(tracker.due_wake(directory, self.config_path, config, False)["decision"], "wake")
+            saved_timer = timer.read_bytes()
+            for minutes in range(5, 60, 5):
+                clock.return_value = now + minutes * 60_000
+                self.assertEqual(tracker.due_wake(directory, self.config_path, config, False)["decision"], "silent",
+                                 f"an unstarted resume must not wake again after {minutes} minutes")
+            self.assertEqual(tracker.due_wake(directory, self.config_path, config, True)["decision"], "wake")
+            self.assertEqual(timer.read_bytes(), saved_timer, "a dry run does not postpone the next real attempt")
+            clock.return_value = now + 60 * 60_000
+            self.assertEqual(tracker.due_wake(directory, self.config_path, config, False)["decision"], "wake")
+
+    def test_active_paging_uses_its_new_lease_instead_of_the_previous_wake_timer(self):
+        spec = importlib.util.spec_from_file_location("tracker_schedule", CLI)
+        tracker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tracker)
+        directory = self.tmp / "schedule"
+        directory.mkdir()
+        now = 1_000_000_000
+        (directory / "timer.json").write_text(json.dumps({"lastWakeAt": now, "nextDue": now + 60 * 60_000}))
+        (directory / "export.json").write_text(json.dumps({"run": {"touchedAt": now + 60_000}}))
+        config = {"intervalMinutes": 60}
+        with mock.patch.object(tracker, "now_ms", return_value=now + 15 * 60_000) as clock:
+            self.assertEqual(tracker.due_wake(directory, self.config_path, config, False)["decision"], "silent")
+            clock.return_value = now + 16 * 60_000
+            self.assertEqual(tracker.due_wake(directory, self.config_path, config, False)["decision"], "wake",
+                             "new page progress starts a fresh lease without waiting for the old hourly timer")
 
     def test_shell_script_with_runtime(self):
         runtime = self.tmp / "runtime.sh"
@@ -1056,6 +1097,47 @@ class Release(Base):
         cli = self.install(self.tmp / "v1")
         proc = subprocess.run([sys.executable, str(cli), "--version"], capture_output=True, text=True)
         self.assertEqual(proc.stdout.strip(), build.current_version())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        info = self.cli("version", script=cli)
+        self.assertEqual((info["installed"], info["updatePolicy"]), (build.current_version(), "manual"))
+        self.assertNotIn("upToDate", info, "an offline version read must not imply a latest-release check")
+        self.assertEqual(self.bt.gets, [], "both version forms are local-only")
+
+    def test_built_hooks_and_exports_never_read_releases_with_missing_or_old_receipts(self):
+        build.build(self.bt.url, self.tmp / "v1", version="9.1.0")
+        cli = self.install(self.tmp / "v1")
+        self.bt.static = self.tmp / "served"
+        build.build(self.bt.url, self.bt.static, source=self.newer_source("newer release available"), version="9.2.0")
+        key = hashlib.sha256(str(self.config_path.resolve()).encode()).hexdigest()[:16]
+        timer = self.tmp / "state" / f"muse-tracker-{key}" / "timer.json"
+        for receipt in (None, {"version": "0.0.1", "sha256": "0" * 64}):
+            with self.subTest(receipt=receipt):
+                self.write_config(**({"setupReceipt": receipt} if receipt else {}))
+                before = timer.read_bytes() if timer.exists() else None
+                dry = self.cli("hook", "--dry-run", script=cli)
+                self.assertEqual(dry["decision"], "wake")
+                self.assertEqual(timer.read_bytes() if timer.exists() else None, before)
+                for _ in range(2):
+                    if timer.exists():
+                        saved = json.loads(timer.read_text())
+                        timer.write_text(json.dumps({**saved, "nextDue": 0}))
+                    payload = self.cli("hook", script=cli)["payload"]
+                    self.assertEqual((payload["installedVersion"], payload["updatePolicy"]), ("9.1.0", "manual"))
+                    self.assertIsNone(payload["skillSha256"])
+                    self.assertIsNone(payload["latestVersion"])
+                    self.assertFalse(payload["updateRequired"])
+                self.assertEqual(self.cli("hook", script=cli)["decision"], "silent")
+                self.assertEqual(self.bt.gets, [], "a built hook must never query its valid release origin")
+        self.add_task("offline-update-checks", self.now - timedelta(hours=1), "Keep exporting")
+        self.add_tool("offline-update-checks", 1, self.now - timedelta(minutes=59))
+        self.add_model("offline-update-checks", "reply", self.now - timedelta(minutes=58))
+        plan = self.cli("plan", script=cli)
+        self.run_tool_queries(plan)
+        result = self.cli("export", script=cli)
+        self.assertFalse(result["more"])
+        self.assertEqual((len(self.bt.of_type("task")), len(self.bt.of_type("tool")), len(self.bt.of_type("llm"))), (1, 1, 1))
+        self.assertEqual(self.cli("hook", script=cli)["decision"], "silent")
+        self.assertEqual(self.bt.gets, [], "routine export succeeds without contacting GitHub")
 
     def test_setup_check_reads_a_fresh_manifest_and_checks_installed_bytes(self):
         self.bt.static = self.tmp / "dist"
@@ -1064,14 +1146,18 @@ class Release(Base):
         self.assertNotIn("{{", cli.read_text())
         self.assertEqual(self.cli("setup-check", script=cli)["sha256"], release["sha256"])
         latest = [g for g in self.bt.gets if g["path"].startswith("/latest/download/manifest.json")]
-        self.assertTrue(latest and all("fresh=" in g["path"] and g["headers"].get("cache-control") == "no-cache"
-                                       for g in latest), "every lookup of the latest release bypasses caches")
+        self.assertTrue(latest and all(g["path"] == "/latest/download/manifest.json"
+                                       and g["headers"].get("cache-control") == "no-cache"
+                                       and g["headers"].get("pragma") == "no-cache"
+                                       for g in latest), "explicit checks use a stable URL with cache revalidation headers")
         followed = [g for g in self.bt.gets if g["path"].startswith(f"/download/v{release['version']}/manifest.json")]
         self.assertEqual(len(followed), len(latest), "each lookup follows the redirect to the versioned asset")
         with (cli.parents[1] / "SKILL.md").open("a") as f:
             f.write("\nlocal edit\n")
         stale = self.cli("setup-check", script=cli, expect=2)
         self.assertEqual((stale["code"], stale["changedFiles"]), ("SKILL_UPDATE_REQUIRED", ["SKILL.md"]))
+        latest = [g["path"] for g in self.bt.gets if g["path"].startswith("/latest/download/manifest.json")]
+        self.assertEqual(latest, ["/latest/download/manifest.json"] * 2, "repeated checks reuse the same release URL")
 
     def test_self_update_installs_the_latest_release_in_place(self):
         v1 = build.build(self.bt.url, self.tmp / "v1")
@@ -1083,17 +1169,21 @@ class Release(Base):
         v2 = build.build(self.bt.url, self.bt.static, source=self.newer_source("release two"), version="9.2.0")
         self.assertNotEqual(v1["sha256"], v2["sha256"])
 
+        self.bt.gets.clear()
         hook = self.cli("hook", script=cli)["payload"]
-        self.assertEqual((hook["skillSha256"], hook["updateRequired"]), (v2["sha256"], True))
-        self.assertEqual((hook["installedVersion"], hook["latestVersion"]), (v1["version"], "9.2.0"))
-        info = self.cli("version", script=cli)
+        self.assertEqual((hook["skillSha256"], hook["updateRequired"]), (None, False))
+        self.assertEqual((hook["installedVersion"], hook["latestVersion"]), (v1["version"], None))
+        self.assertEqual(hook["updatePolicy"], "manual")
+        self.assertEqual(self.bt.gets, [])
+        info = self.cli("version", "--check-updates", script=cli)
         self.assertEqual((info["installed"], info["latest"], info["upToDate"]), (v1["version"], "9.2.0", False))
+        self.assertTrue(self.bt.gets, "only an explicitly requested latest-version check contacts the release host")
 
         result = self.cli("self-update", script=cli)
         self.assertEqual((result["updated"], result["changedFiles"], result["sha256"]), (True, ["SKILL.md", "scripts/muse_tracker.py"], v2["sha256"]),
                          "the version is stamped into the CLI too")
         self.assertEqual((result["fromVersion"], result["version"]), (v1["version"], "9.2.0"))
-        info = self.cli("version", script=cli)
+        info = self.cli("version", "--check-updates", script=cli)
         self.assertEqual((info["installed"], info["latest"], info["upToDate"]), ("9.2.0", "9.2.0", True))
         self.assertIn("version: 9.2.0", (skill / "SKILL.md").read_text())
         self.assertIn("release two", (skill / "SKILL.md").read_text())
@@ -1103,6 +1193,9 @@ class Release(Base):
         self.assertEqual((saved["sha256"], saved["version"]), (v2["sha256"], "9.2.0"))
         self.assertEqual(self.cli("setup-check", script=cli)["sha256"], v2["sha256"])
         self.assertFalse(self.cli("self-update", script=cli)["updated"])
+        archives = [g["path"] for g in self.bt.gets if ".zip" in g["path"]]
+        self.assertEqual(archives, [f"/download/v9.2.0/muse-tracker-9.2.0-{v2['sha256']}.zip"],
+                         "manual updates keep the archive's immutable URL")
 
         # A third release: the updated CLI keeps following the latest.
         self.assertFalse(self.cli("self-update", script=cli)["updated"])

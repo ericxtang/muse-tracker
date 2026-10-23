@@ -87,17 +87,20 @@ release.
 
 **Records never pass through GitHub.** Muse reads `muse.db` and sends rows
 straight to the destination's API with the vault-held key. GitHub sees only
-manifest checks (when an export is due) and downloads (on install and update).
+manifest checks and downloads during installation or an explicit update.
+Routine exports and hook polls never contact GitHub.
 
 ## Releases and updates
 
-**Installs always run the latest release.** Manifest reads bypass every cache,
+**Install the latest release; update on request.** Manifest reads request cache
+revalidation using a stable URL,
 and each release's archive lives at an address that contains its version and
 hash (`muse-tracker-<version>-<sha256>.zip`, cached as immutable), so a cached
-archive can never pass for a newer one. When an export is due, the hook compares
-the installed files with the latest manifest; if they differ, Muse runs
-`self-update`, which downloads that exact archive, checks it and every file, and
-replaces the bundled files in place.
+archive can never pass for a newer one. `self-update` downloads that exact
+archive, checks it and every file, and replaces the bundled files in place.
+Run it when asking Muse to update the skill; automatic release checks are no
+longer part of exports. This avoids repeated per-task GitHub approval cards
+from Muse's background workers. Exports keep running with the installed version.
 
 **A version always names the same content.** `VERSION` holds it, and it is
 stamped into the CLI, `SKILL.md`, the manifest and the archive name.
@@ -106,11 +109,19 @@ sources that differ from their version's record. To check an install:
 
 ```sh
 python3 scripts/muse_tracker.py version
-# {"installed": "0.0.6", "latest": "0.0.6", "upToDate": true, ...}
+# {"installed": "0.0.12", "updatePolicy": "manual", ...} — offline
+python3 scripts/muse_tracker.py version --check-updates
+# {"installed": "0.0.12", "latest": "0.0.12", "upToDate": true, ...} — contacts GitHub
 ```
 
-`upToDate` compares file hashes, not version numbers, so a hand-edited or
-half-updated install reports `false`.
+The explicit online check's `upToDate` compares file hashes, not version
+numbers, so a hand-edited or half-updated install reports `false`. `status`,
+`version`, `--version`, and hook dry runs are offline.
+
+If Muse offers **Allow for this site** during installation, it can save
+permission for the repository's release downloads. **Allow for this task** is
+not permanent, and the skill cannot turn it into a permanent grant. A later
+explicit update may need another approval; routine exports never need GitHub.
 
 **Setup changes.** When a release changes something Setup wrote (a query, the
 hook), bump `SETUP_VERSION` in `build.py` and describe the change under "Setup
@@ -125,7 +136,7 @@ echo 0.0.7 > VERSION                # bump
 python3 build.py --release          # record the new sources
 python3 -m unittest discover -s tests
 git push origin main
-python3 build.py --publish          # creates GitHub release vVERSION; installs update at their next export
+python3 build.py --publish          # creates GitHub release vVERSION; users update on request
 ```
 
 `--publish` refuses a version that already has a release.

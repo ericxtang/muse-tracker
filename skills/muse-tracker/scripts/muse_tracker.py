@@ -846,13 +846,12 @@ def root_from_ledger(config, task_id, entry, limit):
 
 
 def fetch(url, timeout):
-    """GET from the release origin, bypassing every cache on the way."""
+    """GET a stable release URL, asking caches to revalidate it."""
     if not (BASE_URL.startswith("https://") or BASE_URL.startswith("http://127.0.0.1")):
         raise Failure("SETUP_ERROR", "This copy of the skill was not built with a publish URL.", 6)
     if not url.startswith(BASE_URL.rstrip("/") + "/"):
         raise Failure("INVALID_RESPONSE", "The release points outside its own origin.", 5)
-    fresh = url + ("&" if "?" in url else "?") + "fresh=" + uuid.uuid4().hex
-    request = urllib.request.Request(fresh, headers={"Cache-Control": "no-cache", "Pragma": "no-cache"})
+    request = urllib.request.Request(url, headers={"Cache-Control": "no-cache", "Pragma": "no-cache"})
     try:
         with urllib.request.build_opener(ReleaseRedirect()).open(request, timeout=timeout) as response:
             return response.read(MAX_ARCHIVE_BYTES + 1)
@@ -927,8 +926,11 @@ def receipt(manifest, files):
             "sha256": manifest["sha256"], "files": files, "verifiedAt": now_ms()}
 
 
-def version_info():
-    """Is the installed skill the latest release? Compares bytes, not just numbers."""
+def version_info(check_updates=False):
+    """Report the installed version offline; check GitHub only on request."""
+    if not check_updates:
+        return {"ok": True, "installed": VERSION, "updatePolicy": "manual",
+                "next": "Use version --check-updates to check GitHub, or self-update to update."}
     manifest = fetch_manifest()
     changed, _ = stale_files(manifest)
     result = {"ok": True, "installed": VERSION, "latest": manifest["version"], "upToDate": not changed,
@@ -1637,6 +1639,7 @@ def status(config_path, config):
     checked = read_json(config_path).get("setupReceipt") or {}
     covered = state.get("coveredFrom")
     return {"ok": True, "version": VERSION, "lastVerifiedLatest": checked.get("version"),
+            "updatePolicy": "manual",
             "setupVersion": config_setup_version(config), "setupRequired": setup_required(config),
             "historyFrom": iso(covered) if covered else None, "lastBackfill": state.get("lastBackfill"),
             "stateDir": str(directory), "watermark": iso(watermark) if watermark else None,
@@ -1655,7 +1658,7 @@ def status(config_path, config):
 
 
 def hook(config_path, config, dry_run=False):
-    """Decide whether an export is due. Never loads credentials."""
+    """Decide whether an export is due. No network access or credentials."""
     try:
         with Locked(state_dir(config_path), wait=False) as directory:
             return due_wake(directory, config_path, config, dry_run)
@@ -1677,8 +1680,12 @@ def due_wake(directory, config_path, config, dry_run):
         due = exported_at + interval
     elif state.get("run") and not state.get("failure"):
         # A worker is paging through a run. Wait while it is active; resume it
-        # once its lease lapses (the worker ended early).
-        due = state["run"].get("touchedAt", 0) + RUN_LEASE_MS
+        # once its lease lapses (the worker ended early). If a recovery wake
+        # has already been emitted but no page ran, honor that wake's retry
+        # timer instead of launching another worker on every five-minute poll.
+        touched_at = state["run"].get("touchedAt", 0)
+        due = (timer.get("nextDue", 0) if timer.get("lastWakeAt", -1) >= touched_at
+               else touched_at + RUN_LEASE_MS)
     else:
         due = timer.get("nextDue", 0)
     if not dry_run and now < due:
@@ -1687,18 +1694,15 @@ def due_wake(directory, config_path, config, dry_run):
     # Fallback if this wake's export never runs. Repeated failures back off
     # to at most once a day.
     delay = min(interval * 2 ** (failures - 2), max(interval, 24 * 3_600_000)) if failures >= 3 else interval
-    # Compare the files actually installed with the latest release, so a partial
-    # or edited install is caught too, not just a stale receipt.
-    try:
-        manifest = fetch_manifest(timeout=10)
-        skill_sha, update_required = manifest["sha256"], bool(stale_files(manifest)[0])
-        latest_version = manifest["version"]
-    except Failure:
-        skill_sha, update_required, latest_version = None, False, None
+    # Installation and explicit updates own release access. Background workers
+    # get per-task web approvals in Muse, so even a successful prior download
+    # is not permission for this wake to check GitHub. Keep the hook offline,
+    # including dry runs, recovery wakes and installs without a setup receipt.
+    # Retain the old payload keys for callers; they must not trigger updates.
     payload_ = {"attemptId": str(uuid.uuid4()), "wakeId": str(uuid.uuid4()), "wakeEmittedAt": now,
                 "config": str(config_path), "reasons": ["setup"] if dry_run else ["export"],
-                "installedVersion": VERSION, "latestVersion": latest_version,
-                "skillSha256": skill_sha, "updateRequired": update_required,
+                "installedVersion": VERSION, "latestVersion": None,
+                "skillSha256": None, "updateRequired": False, "updatePolicy": "manual",
                 "setupRequired": setup_required(config), "failureCount": failures,
                 "watermark": iso(state["watermark"]) if state.get("watermark") else None}
     if not dry_run:
@@ -1712,6 +1716,8 @@ def main():
     parser.add_argument("command", choices=["version", "setup-check", "self-update", "setup-done", "migrate", "check", "plan", "export", "status",
                                             "hook", "probe", "reconcile", "find", "backfill"])
     parser.add_argument("--version", action="version", version=VERSION, help="Print the installed version and exit")
+    parser.add_argument("--check-updates", action="store_true",
+                        help="version: explicitly contact GitHub to compare with the latest release")
     parser.add_argument("--config", default=os.environ.get("MUSE_TRACKER_CONFIG"))
     parser.add_argument("--attempt", help="Wake attemptId; recorded for traceability only")
     parser.add_argument("--dry-run", action="store_true")
@@ -1729,8 +1735,10 @@ def main():
     parser.add_argument("--beyond-read-window", action="store_true",
                         help="backfill (Langfuse): send history older than the plan's read window, unchecked")
     args = parser.parse_args()
+    if args.check_updates and args.command != "version":
+        parser.error("--check-updates is only supported by version")
     if args.command == "version":
-        return version_info()
+        return version_info(args.check_updates)
     if args.command in ("setup-check", "self-update"):
         path = load_config(args.config)[0] if args.config else None
         current = read_json(path) if path else None
